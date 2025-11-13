@@ -317,7 +317,7 @@ class WhatsNew(QDialog):
         if changelog is None:
             changelog = [
                 {'version': f'{__version__}',
-                'date': '2025-11-13' ,
+                'date': '2025-11-14' ,
                 'highlights': [
                     '🛠️ Bug Fixes & Improvements',
                     '🚀 Performance Enhancements',

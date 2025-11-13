@@ -647,7 +647,7 @@ class SettingsWindow(QDialog):
         self.stack.addWidget(updates_widget)
 
     def setup_backend_paths_tab(self):
-        # TODO Allow users to select their custom cookies.txt and ffmpeg.exe -- Next Version 
+        # TODO Allow users to select their custom cookies.txt and ffmpeg.exe via the backend paths tab -- Next Versions  
         """
         Tab allowing selection of:
         - optional custom yt-dlp executable (checkbox to enable)
@@ -734,7 +734,7 @@ class SettingsWindow(QDialog):
                 return False
 
         def _suggest_chmod_cmd(path: str) -> str:
-            return f"On Unix run: chmod 777 {path}"
+            return f"On Unix run: chmod +x {path}"
 
         # Try to run '<exe> --version' to check it behaves like yt-dlp/ffmpeg.
         # Uses short timeout so UI won't hang.
@@ -918,12 +918,55 @@ class SettingsWindow(QDialog):
             self.ffmpeg_warning.setVisible(False)
             return True
 
+        def _validate_deno_path():
+            p = self.deno_lineedit.text().strip()
+            if not p:
+                # empty means "use system ffmpeg" — OK
+                self.deno_warning.setVisible(False)
+                return True
+            if not os.path.exists(p):
+                self.deno_warning.setText("deno path does not exist.")
+                self.deno_warning.setVisible(True)
+                return False
+            if not os.path.isfile(p):
+                self.deno_warning.setText("Selected deno is not a file.")
+                self.deno_warning.setVisible(True)
+                return False
+            if not _is_executable_file(p):
+                if sys.platform.startswith("win"):
+                    self.deno_warning.setText(
+                        "The selected deno does not look like an executable (.exe). Make sure you selected deno binary."
+                    )
+                else:
+                    self.deno_warning.setText(
+                        "The selected deno is not executable. " + _suggest_chmod_cmd(p)
+                    )
+                self.deno_warning.setVisible(True)
+                return False
+
+            # Probe the binary for ffmpeg signature
+            looks_like, msg = _probe_exe_for_signature(p, expected_keywords=["deno", "deno version"])
+            if not looks_like:
+                short = (msg[:300] + "...") if msg and len(msg) > 300 else msg
+                self.deno_warning.setText(
+                    f"Selected file did not identify as deno when probed with '--version'.\n"
+                    f"Probe output: {short}\n"
+                    "If this is a wrapper, ensure it forwards --version or select the real ffmpeg binary."
+                )
+                self.deno_warning.setVisible(True)
+                return False
+
+            self.deno_warning.setVisible(False)
+            config.deno_verified = True
+            return True
+
         def _validate_all():
             # returns True if everything valid
             a = _validate_yt_path()
+            b = _validate_deno_path()
             # b = _validate_cookies_path()
             # c = _validate_ffmpeg_path()
-            return a # and b and c 
+            return a, b # and b and c 
 
         # ---------- yt-dlp UI ----------
         yt_group = QGroupBox(self.tr("yt-dlp (optional custom path)"))
@@ -999,6 +1042,48 @@ class SettingsWindow(QDialog):
         yt_layout.addWidget(self.yt_warning)
         yt_layout.addWidget(self.yt_success)
         main_layout.addWidget(yt_group)
+
+
+        # --------- deno UI -------------
+        deno_group = QGroupBox("Deno")
+        deno_layout = QVBoxLayout(deno_group)
+        deno_layout.setContentsMargins(6, 6, 6, 6)
+        deno_layout.setSpacing(6)
+
+        deno_row_widget, self.deno_lineedit, self.deno_browse_btn = _make_row(
+            "deno:", "Path to Deno JS Runtime exe"
+        )
+
+        # Prefill deno from config if available
+        try:
+            # initial_dn = getattr(config, "deno_actual_path", "") or ""
+            initial_dn = config.deno_actual_path or ""
+            if initial_dn:
+                self.deno_lineedit.setText(initial_dn)
+        except Exception:
+            pass
+
+        if sys.platform.startswith("win"):
+            dn_filter = "Executables (*.exe);;All Files (*)"
+        else:
+            dn_filter = "All Files (*)"
+
+        def _on_browse_deno():
+            selected = _select_file(self.deno_lineedit, "Select deno executable", dn_filter)
+            if not selected:
+                return
+            try:
+                config.set_user_deno(selected)
+            except Exception:
+                pass
+            _validate_deno_path()
+
+        self.deno_browse_btn.clicked.connect(_on_browse_deno)
+
+        self.deno_warning = _make_warning_label()
+        deno_layout.addWidget(deno_row_widget)
+        deno_layout.addWidget(self.deno_warning)
+        main_layout.addWidget(deno_group)
 
         # ---------- cookies UI ----------
         cookies_group = QGroupBox("Cookies")
@@ -1310,6 +1395,7 @@ class SettingsWindow(QDialog):
         # Backend Paths
         self.yt_checkbox.setChecked(config.enable_ytdlp_exe)
         self.yt_lineedit.setText(config.yt_dlp_exe if config.yt_dlp_exe else '')
+        self.deno_lineedit.setText(config.deno_exe if config.deno_exe else '')
 
         # Check for updates settings
         self.check_interval_combo.setCurrentText(str(config.update_frequency))
@@ -1404,6 +1490,7 @@ class SettingsWindow(QDialog):
         # Backend Paths
         config.yt_dlp_exe = self.yt_lineedit.text().strip()
         config.enable_ytdlp_exe = self.yt_checkbox.isChecked()
+        config.deno_exe = self.deno_lineedit.text().strip()
 
         # Check for updates settings
         config.update_frequency = int(self.check_interval_combo.currentText())

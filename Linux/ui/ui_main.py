@@ -502,19 +502,6 @@ class Ui_MainWindow(object):
         right_layout.addLayout(button_row)
 
 
-        # NEW: Middle Frame
-        middle_frame = QFrame()
-        middle_frame.setFrameShape(QFrame.StyledPanel)
-        middle_layout = QVBoxLayout(middle_frame)
-        middle_layout.setContentsMargins(12, 12, 12, 12)
-        middle_layout.setSpacing(8)
-
-        # Optional placeholder content
-        middle_label = QLabel("Subtitles / Extras")
-        middle_label.setStyleSheet("color: white;")
-        middle_layout.addWidget(middle_label)
-
-        # content_row.addWidget(middle_frame, stretch=1)  # 👈 NEW PANEL
         content_row.addWidget(left_frame, stretch=1)
        
         content_row.addWidget(right_frame, stretch=1)
@@ -546,6 +533,7 @@ class Ui_MainWindow(object):
 
         self.toolbar_buttons = {}
         icon_map = {
+            # "Add Download": ":/icons/add.svg",
             "Resume": ":/icons/play.svg",
             "Pause": ":/icons/pause.svg",
             "Stop All": ":/icons/stop_all.svg",

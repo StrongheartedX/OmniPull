@@ -107,7 +107,14 @@ class SettingsManager:
                 extra_paths=config._ytdlp_extra_paths,
             )
             log(f'yt-dlp path: {config.yt_dlp_actual_path}', log_level=1)
-
+            config.deno_actual_path = config._find_tool(
+                "deno",
+                selected=(config.deno_exe or config.user_selected_deno),
+                bundled_name = "deno.exe",
+                extra_paths = config._deno_extra_paths
+            )
+            log(f'deno path: {config.deno_actual_path}', log_level=1)
+            config.deno_verified = True if config.deno_actual_path else False
         except Exception as e:
             log(f"Error loading settings: {e}", log_level=3)
 

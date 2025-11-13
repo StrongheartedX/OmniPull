@@ -316,7 +316,23 @@ class WhatsNew(QDialog):
 
         if changelog is None:
             changelog = [
-                {'version': f'{__version__}', 
+                {'version': f'{__version__}',
+                'date': '2025-11-13' ,
+                'highlights': [
+                    '🛠️ Bug Fixes & Improvements',
+                    '🚀 Performance Enhancements',
+                    '🌐 UI/UX Tweaks',
+                    '🆕 Deno Added and Enabled by Default'
+                ],
+                'details': 'We are excited to announce the release of OmniPull version 2.0.7! This update focuses on enhancing stability, performance, and user experience. \n\n'
+                            '🛠️ **Bug Fixes & Improvements:** We have addressed several bugs reported by our users, ensuring a smoother and more reliable experience. \n\n'
+                            '🚀 **Performance Enhancements:** Significant optimizations have been made to improve download speeds and overall application responsiveness. \n\n'
+                            '🌐 **UI/UX Tweaks:** We have refined the user interface to make it more intuitive and visually appealing, enhancing your interaction with the app. \n\n'
+                            '🆕 **Deno Added and Enabled by Default:** Deno, a secure runtime for JavaScript and TypeScript, has been integrated into OmniPull and is now enabled by default. This addition enhances the app\'s capabilities and performance when handling JavaScript-based content as required by YT-DLP. \n User\'s might have to download and install it system wide or use the settings to point to path. \n\n',
+                'url': 'https://github.com/Annor-Gyimah/OmniPull/releases/tag/v.2.0.7'
+                
+                },
+                {'version': f'2.0.3', 
                 'date': '2025-10-25', 
                 'highlights': [
                     '🧩 Custom yt-dlp.exe \n Support',

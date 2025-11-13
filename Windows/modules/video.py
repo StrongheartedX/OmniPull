@@ -28,6 +28,7 @@ import shlex
 import shutil
 import asyncio
 import zipfile
+import requests
 import platform
 import subprocess
 from modules import config
@@ -72,6 +73,16 @@ def get_ytdl_options():
         'ignoreerrors': config.ytdlp_config.get('ignore_errors', True),
         'cookies': config.ytdlp_config['cookiesfile'],
         'verbose': True,
+        'js_runtimes': {
+           'deno': {
+                'executable': config.get_effective_deno()
+            },
+            # Optional fallbacks (use PATH if you omit 'executable'):
+            # 'node': {},
+            # 'quickjs': {},
+            # 'bun': {},
+        },
+    
 
 
         
@@ -99,6 +110,26 @@ def get_ytdl_options():
 #     import yt_dlp as ytdl
 #     with ytdl.YoutubeDL(ydl_opts) as ydl:
 #         return ydl.extract_info(url, download=False, process=True)
+
+def _format_js_runtimes_cli(jsr) -> str | None:
+    # Accept dict (API-style), list/tuple (preformatted), or string (already CLI-style)
+    if isinstance(jsr, dict):
+        parts = []
+        for name, cfg in jsr.items():
+            exe = None
+            if isinstance(cfg, dict):
+                exe = cfg.get('executable') or cfg.get('path')
+            if exe:
+                parts.append(f"{name}:{exe}")
+            else:
+                parts.append(name)
+        return ",".join(parts) if parts else None
+    if isinstance(jsr, (list, tuple)):
+        return ",".join(str(x) for x in jsr) if jsr else None
+    if isinstance(jsr, str):
+        return jsr or None
+    return None
+
     
 def _ydl_opts_to_args(ydl_opts: dict, allow_listformats: bool = False) -> list[str]:
     """
@@ -140,6 +171,12 @@ def _ydl_opts_to_args(ydl_opts: dict, allow_listformats: bool = False) -> list[s
     # Prefer insecure
     if ydl_opts.get("prefer_insecure", False):
         args.append("--prefer-insecure")
+
+    # JS runtimes (Deno/Node/QuickJS/Bun)
+    jsr = ydl_opts.get("js_runtimes")
+    cli_jsr = _format_js_runtimes_cli(jsr)
+    if cli_jsr:
+        args += ["--js-runtimes", cli_jsr]
 
     return args
 
@@ -662,37 +699,134 @@ class Stream:
         return self._mediatype
 
 
-def download_ffmpeg(destination=config.sett_folder):
-    """it should download ffmpeg.exe for windows os"""
+# Map your app-level destination folder default if needed
+DEFAULT_DEST = getattr(config, 'sett_folder', '.')
 
-    # set download folder
+def _gh_latest_asset(owner_repo: str, *, match_any, token: str | None = None):
+    """
+    Return (asset_name, asset_browser_download_url) for the first asset whose
+    name matches any of the provided predicates (in order).
+    """
+    api = f"https://api.github.com/repos/{owner_repo}/releases/latest"
+    headers = {'Accept': 'application/vnd.github+json'}
+    if token:
+        headers['Authorization'] = f"Bearer {token}"
+    r = requests.get(api, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    assets = data.get('assets') or []
+    # Try each predicate until one matches
+    for pred in match_any:
+        for a in assets:
+            name = a.get('name') or ''
+            if pred(name):
+                return name, a.get('browser_download_url')
+    raise RuntimeError(f"No matching assets found in {owner_repo} latest release")
+
+def _is_win():
+    return platform.system().lower().startswith('win')
+
+def _cpu():
+    # normalize to strings we use
+    m = platform.machine().lower()
+    # common normalizations
+    if m in ('amd64', 'x86_64', 'x64'):
+        return 'x86_64'
+    if m in ('arm64', 'aarch64'):
+        return 'arm64'
+    if m in ('x86', 'i386', 'i686'):
+        return 'x86'
+    return m
+
+def download_dependency(*, name: str, destination: str = DEFAULT_DEST):
+    """
+    Download latest Windows ZIP for yt-dlp FFmpeg builds or Deno from GitHub releases.
+    - name: 'ffmpeg' or 'deno'
+    - destination: where your DownloadItem should store the file
+    Sets the right filename and callback for your unzip logic.
+    """
+    # expose both folders for your unzip code (kept from your original)
     config.ffmpeg_download_folder = destination
+    config.deno_download_folder = destination
 
-    # first check windows 32 or 64
+    if not _is_win():
+        # You said Windows only; bail early with a helpful log
+        log(f"[download_dependency] Non-Windows OS detected; no Windows ZIP selected for {name}")
+        return
 
-    # ends with 86 for 32 bit and 64 for 64 bit i.e. Win7-64: AMD64 and Vista-32: x86
-    if platform.machine().endswith('64'):
-        # 64 bit link
-        url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
-        
-    else:
-        # 32 bit link
-        url = 'https://www.videohelp.com/download/ffmpeg-4.3.1-win32-static.zip'
+    token = getattr(config, 'github_token', None)  # optional, for rate limits
+    arch = _cpu()
 
-    log('downloading: ', url)
+    if name.lower() == 'ffmpeg':
+        # yt-dlp’s FFmpeg builds: yt-dlp/FFmpeg-Builds (latest release)
+        # Choose gpl variant, prefer the “master/latest” flavor, fall back to any N-*-gpl.zip
+        def want_ffmpeg(asset_name: str) -> bool:
+            # Accept e.g.:
+            #   ffmpeg-master-latest-win64-gpl.zip
+            #   ffmpeg-N-121583-...-win64-gpl.zip
+            an = asset_name.lower()
+            if not an.endswith(".zip"):
+                return False
+            if "win" not in an or "gpl" not in an:
+                return False
+            if arch == 'x86_64' and "win64" in an:
+                return True
+            if arch == 'x86' and "win32" in an:
+                return True
+            if arch == 'arm64' and "winarm64" in an:
+                return True
+            return False
 
-    # create a download object, will store ffmpeg in setting folder
-    # print('config.sett_folder = ', config.sett_folder)
-    d = DownloadItem(url=url, folder=config.ffmpeg_download_folder)
-    d.update(url)
-    d.name = 'ffmpeg.zip'  # must rename it for unzip to find it
-    # print('d.folder = ', d.folder)
+        # Two passes: prefer "master-latest" naming, then any gpl zip for our arch
+        pickers = [
+            lambda n: "master-latest" in n.lower() and want_ffmpeg(n),
+            lambda n: want_ffmpeg(n),
+        ]
+        asset_name, url = _gh_latest_asset("yt-dlp/FFmpeg-Builds", match_any=pickers, token=token)
 
-    # post download
-    d.callback = 'unzip_ffmpeg'
+        # Build DownloadItem
+        log("downloading (ffmpeg): ", url)
+        d = DownloadItem(url=url, folder=config.ffmpeg_download_folder)
+        d.update(url)
+        d.name = 'ffmpeg.zip'          # your unzip_ffmpeg expects this
+        d.callback = 'unzip_ffmpeg'    # keep your existing callback
+        config.main_window_q.put(('download', (d, False)))
+        return
 
-    # send download request to main window
-    config.main_window_q.put(('download', (d, False)))
+    if name.lower() == 'deno':
+        # Official deno release: denoland/deno (latest)
+        # We want deno-x86_64-pc-windows-msvc.zip on Windows x64
+        # (No official 32-bit Windows archive; handle gracefully.)
+        def want_deno(asset_name: str) -> bool:
+            an = asset_name.lower()
+            if not an.endswith(".zip"):
+                return False
+            # canonical Windows 64-bit artifact:
+            return an == "deno-x86_64-pc-windows-msvc.zip"
+
+        if arch != 'x86_64':
+            raise RuntimeError("Deno ships Windows binaries for x86_64 only; unsupported CPU on Windows")
+
+        asset_name, url = _gh_latest_asset("denoland/deno", match_any=[want_deno], token=token)
+
+        log("downloading (deno): ", url)
+        d = DownloadItem(url=url, folder=config.deno_download_folder)
+        d.update(url)
+        d.name = 'deno.zip'            # so your unzip routine can branch
+        d.callback = unzip_deno
+        config.main_window_q.put(('download', (d, False)))
+        return
+
+    raise ValueError(f"Unsupported dependency name: {name!r}")
+
+
+def download_deno(destination):
+    download_dependency(name='deno', destination=destination)
+
+def download_ffmpeg(destination):
+    download_dependency(name='ffmpeg', destination=destination)
+
+
 
 
 def download_aria2c_with_wget(url, save_dir, filename):
@@ -724,60 +858,119 @@ def download_aria2c(destination=config.sett_folder):
 
 
 
-def unzip_ffmpeg():
-    log('unzip_ffmpeg:', 'unzipping')
+
+def unzip_dependency(
+    *,
+    zip_basename: str,          # e.g. 'ffmpeg.zip' / 'deno.zip'
+    exe_name: str,              # 'ffmpeg.exe' / 'deno.exe'
+    folder_attr: str,           # 'ffmpeg_download_folder' / 'deno_download_folder'
+    popup_title: str,           # UI title
+    popup_msg: str,             # UI message
+    on_installed=None,          # callback(dest_exe_path) -> None
+):
+    log(f'unzip_dependency[{exe_name}]', 'unzipping')
     try:
-        folder = config.ffmpeg_download_folder
-        file_name = os.path.join(folder, 'ffmpeg.zip')
+        folder = getattr(config, folder_attr)
+        os.makedirs(folder, exist_ok=True)
 
-        # List folders before extraction
-        before = set(os.listdir(folder))
+        file_name = os.path.join(folder, zip_basename)
+        log(f'unzip_dependency[{exe_name}]', f'zip file: {file_name}')
 
-        # Extract zip file
+        if not os.path.exists(file_name):
+            raise FileNotFoundError(f"ZIP not found: {file_name}")
+
         with zipfile.ZipFile(file_name, 'r') as zip_ref:
-            zip_ref.extractall(folder)
+            members = zip_ref.namelist()
+            log(f'unzip_dependency[{exe_name}]', f'zip contains: {members}')
 
-        # List folders after extraction
-        after = set(os.listdir(folder))
-        new_items = after - before
-
-        # Find the new folder (could be more than one, but usually just one)
-        extracted_folder = None
-        for item in new_items:
-            path = os.path.join(folder, item)
-            if os.path.isdir(path):
-                extracted_folder = path
-                break
-
-        log('ffmpeg update:', f'Extracted folder: {extracted_folder}')
-
-        # Optionally, move/copy ffmpeg.exe from extracted_folder to folder, or update config
-        # Example: find ffmpeg.exe inside extracted_folder
-        ffmpeg_exe = None
-        for root, dirs, files in os.walk(extracted_folder):
-            for file in files:
-                if file.lower() == "ffmpeg.exe":
-                    ffmpeg_exe = os.path.join(root, file)
+            # Find the exe inside the zip (allow nested paths)
+            exe_member = None
+            exe_lower = exe_name.lower()
+            for m in members:
+                if m.lower().endswith(exe_lower):
+                    exe_member = m
                     break
-            if ffmpeg_exe:
-                break
 
-        if ffmpeg_exe:
-            dest = os.path.join(folder, "ffmpeg.exe")
-            shutil.move(ffmpeg_exe, dest)
-            log('ffmpeg update:', f'ffmpeg.exe moved to {dest}')
-        else:
-            log('ffmpeg update:', 'ffmpeg.exe not found in extracted folder')
+            if not exe_member:
+                log(f'unzip_dependency[{exe_name}]', f'{exe_name} not found in archive')
+                # still show a popup so the user knows something went wrong
+                param = dict(
+                    title=f"{popup_title} (Error)",
+                    msg=f"Archive did not contain {exe_name}.",
+                    type_='error',
+                )
+                config.main_window_q.put(('popup', param))
+                return
 
-        # Clean up zip file
-        delete_file(file_name)
-        delete_folder(extracted_folder, verbose=True)
-        
-        param = dict(title='Ffmpeg Info', msg='Ffmpeg is now available. Please try download the video again.', type_='info')
+            dest = os.path.join(folder, exe_name)
+
+            # Remove any existing exe
+            try:
+                if os.path.exists(dest):
+                    os.remove(dest)
+            except Exception as e:
+                log(f'unzip_dependency[{exe_name}]', f'could not remove existing exe: {e}')
+
+            # Extract just that exe to dest
+            log(f'unzip_dependency[{exe_name}]', f'extracting member {exe_member} to {dest}')
+            with zip_ref.open(exe_member) as src, open(dest, 'wb') as out:
+                shutil.copyfileobj(src, out)
+
+        # Remove the zip after successful extraction
+        try:
+            delete_file(file_name)
+        except Exception as e:
+            log(f'unzip_dependency[{exe_name}]', f'could not delete zip: {e}')
+
+        # Post-install hook
+        if callable(on_installed):
+            try:
+                on_installed(dest)
+            except Exception as e:
+                log(f'unzip_dependency[{exe_name}] on_installed error', e)
+
+        # UI popup
+        param = dict(title=popup_title, msg=popup_msg, type_='info')
         config.main_window_q.put(('popup', param))
-        log('ffmpeg update:', 'ffmpeg .. is ready at: ', folder)
+        log(f'unzip_dependency[{exe_name}]', f'{exe_name} is ready at: {folder}')
+
     except Exception as e:
-        log('unzip_ffmpeg: error ', e)
+        log(f'unzip_dependency[{exe_name}] error', e)
+
+
+def unzip_ffmpeg():
+    def _on_ffmpeg(dest):
+        # update wherever you keep your canonical ffmpeg path
+        config.ffmpeg_actual_path = dest
+    return unzip_dependency(
+        zip_basename='ffmpeg.zip',
+        exe_name='ffmpeg.exe',
+        folder_attr='ffmpeg_download_folder',
+        popup_title='FFmpeg Info',
+        popup_msg='FFmpeg is now available. Please try downloading the video again.',
+        on_installed=_on_ffmpeg,
+    )
+
+
+def unzip_deno():
+    def _on_deno(dest):
+        # remember deno path so yt-dlp can use it
+        config.deno_actual_path = dest
+        print(f'{config.deno_actual_path}')
+        config.deno_verified = True
+        # if you build yt-dlp options from config, this makes it automatic:
+        # e.g., in get_ytdl_options():
+        #   if getattr(config, 'deno_executable', None):
+        #       ydl_opts['js_runtimes'] = {'deno': {'executable': config.deno_executable}}
+    return unzip_dependency(
+        zip_basename='deno.zip',
+        exe_name='deno.exe',
+        folder_attr='deno_download_folder',
+        popup_title='Deno Info',
+        popup_msg='Deno is now available. YouTube extraction should work on the next attempt.',
+        on_installed=_on_deno,
+    )
+
 
 
 
@@ -824,6 +1017,47 @@ def unzip_aria2c():
         log('unzip_aria2c: error', e)
 
 
+def check_deno():
+    """Check for deno availability, and cache result to avoid re-checking."""
+
+    # ✅ If previously verified, skip check
+    if config.deno_verified:
+        return True
+
+    log('Checking Deno availability...')
+    found = False
+
+    try:
+        for folder in [config.current_directory, config.global_sett_folder]:
+            if not folder: continue  # skip if not set
+            for file in os.listdir(folder):
+                if file.lower().startswith("deno"):
+                    full_path = os.path.join(folder, file)
+                    if os.path.isfile(full_path):
+                        found = True
+                        config.deno_actual_path = full_path
+                        break
+            if found:
+                break
+    except Exception as e:
+        log(f"Error while checking folders for deno: {e}")
+
+    # Try system PATH
+    if not found:
+        from shutil import which
+        path = which("deno")
+        if path:
+            config.deno_actual_path = os.path.realpath(path)
+            found = True
+
+    if found:
+        config.deno_verified = True  # ✅ Cache success
+        log('Deno found:', config.deno_actual_path)
+        return True
+    else:
+        config.deno_actual_path = None
+        log('Deno not found. Will prompt user.')
+        return False
 
 def check_ffmpeg():
     """Check for ffmpeg availability, and cache result to avoid re-checking."""

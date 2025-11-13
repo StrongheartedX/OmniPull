@@ -18,6 +18,7 @@
 import os
 import re
 import json
+import sys
 import time
 import queue
 import socket
@@ -37,7 +38,7 @@ from modules.aria2c_manager import aria2c_manager
 from modules.postprocessing import async_merge_video_audio
 from modules.config import Status, APP_NAME, get_effective_ffmpeg
 from modules.utils import (log, size_format, popup, notify, delete_folder, delete_file, rename_file, validate_file_name)
-from modules.video import (is_download_complete, get_ytdl_options, extract_info_blocking, pre_process_hls, post_process_hls, unzip_ffmpeg) 
+from modules.video import (is_download_complete, get_ytdl_options, extract_info_blocking, pre_process_hls, post_process_hls, unzip_ffmpeg, unzip_deno) 
 
 
 lock = Lock()
@@ -301,7 +302,13 @@ def run_curl_download(d, emitter=None):
 
         if getattr(d, "callback", None) and d.status == Status.completed:
             try:
-                globals()[d.callback]()
+                cb = d.callback
+                if callable(cb):
+                    cb()
+                elif isinstance(cb, str):
+                    func = globals().get(cb)
+                    if func: func()
+                    else: log(f"[brain] callback not found: {cb}")
             except Exception as cb_e:
                 log(f"[brain] callback error: {cb_e}")
 
@@ -643,6 +650,17 @@ def run_aria2c_download(d,  emitter=None):
 
             # active / waiting keep looping
             # (no-op here; loop continues)
+            if getattr(d, "callback", None) and d.status == Status.completed:
+                try:
+                    cb = d.callback
+                    if callable(cb):
+                        cb()
+                    elif isinstance(cb, str):
+                        func = globals().get(cb)
+                        if func: func()
+                        else: log(f"[brain] callback not found: {cb}")
+                except Exception as cb_e:
+                    log(f"[brain] callback error: {cb_e}")
 
     except Exception as e:
         emit_log("Fatal aria2 monitor error:\n" + traceback.format_exc())
@@ -957,6 +975,18 @@ def run_aria2c_video_audio_download(d, emitter=None):
             if d.status == Status.cancelled:
                 log(f"[Aria2c] Download cancelled: {d.name}")
                 return
+            
+            if getattr(d, "callback", None) and d.status == Status.completed:
+                try:
+                    cb = d.callback
+                    if callable(cb):
+                        cb()
+                    elif isinstance(cb, str):
+                        func = globals().get(cb)
+                        if func: func()
+                        else: log(f"[brain] callback not found: {cb}")
+                except Exception as cb_e:
+                    log(f"[brain] callback error: {cb_e}")
 
     except Exception as e:
         d.status = Status.error
@@ -971,7 +1001,7 @@ def probe_ffmpeg_file(file_path: str, ffmpeg_path: str) -> bool:
     """Returns True if file is valid and ffmpeg can read it."""
     try:
         result = subprocess.run(
-            [ffmpeg_path.replace("ffmpeg", "ffprobe.exe"), "-v", "error", "-i", file_path],
+            [ffmpeg_path.replace("ffmpeg.exe", "ffprobe.exe"), "-v", "error", "-i", file_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
@@ -1093,8 +1123,8 @@ def _build_cli_args_for_download(d, ydl_opts: dict, use_progress_template: bool 
         args.append("--write-description")
     if ydl_opts.get("writeannotations"):
         args.append("--write-annotations")
-    # if ydl_opts.get("writemetadata"):
-    #     args.append("--write-metadata")
+    if ydl_opts.get("writemetadata"):
+        args.append("--write-metadata")
     if ydl_opts.get("merge_output_format"):
         args += ["--merge-output-format", str(ydl_opts.get("merge_output_format"))]
     if ydl_opts.get("ignore_errors", False):
@@ -1142,7 +1172,7 @@ def run_ytdlp_download_exe(d, emitter=None, exe_timeout: float = 3600.0, use_pro
             pass
 
     output_path = os.path.join(d.folder, d.name)
-    ffmpeg_path = get_effective_ffmpeg() or os.path.join(getattr(config, "sett_folder", ""), "ffmpeg")
+    ffmpeg_path = get_effective_ffmpeg() or os.path.join(getattr(config, "sett_folder", ""), "ffmpeg.exe")
 
     format_code = None
     if getattr(d, "format_id", None) and getattr(d, "audio_format_id", None):
@@ -1196,9 +1226,20 @@ def run_ytdlp_download_exe(d, emitter=None, exe_timeout: float = 3600.0, use_pro
 
     cli_args = _build_cli_args_for_download(d, ydl_opts, use_progress_template=use_progress_template)
     cmd = [exe] + cli_args + [d.url]
-
+    
     # Launch process combining stderr into stdout so we capture everything
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+    kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = si
+
+    proc = subprocess.Popen(cmd, **kwargs)
+
+    # proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
 
     q = queue.Queue()
     reader = Thread(target=_enqueue_output, args=(proc.stdout, q), daemon=True)
@@ -1471,8 +1512,10 @@ def run_ytdlp_download_exe(d, emitter=None, exe_timeout: float = 3600.0, use_pro
                         "-shortest",
                         output_file
                     ]
-
-                    result = subprocess.run(cmd_ff, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    kwargs = dict(capture_output=True, text=True)
+                    if sys.platform.startswith("win"):
+                        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                    result = subprocess.run(cmd_ff, **kwargs)
                     if result.returncode == 0:
                         d.status = Status.completed
                         d._progress = 100
@@ -1532,6 +1575,17 @@ def run_ytdlp_download_exe(d, emitter=None, exe_timeout: float = 3600.0, use_pro
                 emitter.log_updated.emit(f"[yt-dlp-exe] Done processing {getattr(d, 'name', 'unknown')}")
             except Exception:
                 pass
+        if getattr(d, "callback", None) and d.status == Status.completed:
+            try:
+                cb = d.callback
+                if callable(cb):
+                    cb()
+                elif isinstance(cb, str):
+                    func = globals().get(cb)
+                    if func: func()
+                    else: log(f"[brain] callback not found: {cb}")
+            except Exception as cb_e:
+                log(f"[brain] callback error: {cb_e}")
 
 def run_ytdlp_download(d, emitter=None):
     log(f"[yt-dlp] Starting download: {d.name}")
@@ -1704,6 +1758,25 @@ def run_ytdlp_download(d, emitter=None):
         log(f"[yt-dlp] Done processing {d.name}")
         if emitter:
             emitter.log_updated.emit(f"[yt-dlp] Done processing {d.name}")
+
+        if getattr(d, "callback", None) and d.status == Status.completed:
+            try:
+                cb = d.callback
+                if callable(cb):
+                    cb()
+                elif isinstance(cb, str):
+                    func = globals().get(cb)
+                    if func: func()
+                    else: log(f"[brain] callback not found: {cb}")
+            except Exception as cb_e:
+                log(f"[brain] callback error: {cb_e}")
+
+        
+        # if getattr(d, "callback", None) and d.status == Status.completed:
+        #     try:
+        #         globals()[d.callback]()
+        #     except Exception as cb_e:
+        #         log(f"[brain] callback error: {cb_e}")
 
 
 

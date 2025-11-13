@@ -502,19 +502,6 @@ class Ui_MainWindow(object):
         right_layout.addLayout(button_row)
 
 
-        # NEW: Middle Frame
-        middle_frame = QFrame()
-        middle_frame.setFrameShape(QFrame.StyledPanel)
-        middle_layout = QVBoxLayout(middle_frame)
-        middle_layout.setContentsMargins(12, 12, 12, 12)
-        middle_layout.setSpacing(8)
-
-        # Optional placeholder content
-        middle_label = QLabel("Subtitles / Extras")
-        middle_label.setStyleSheet("color: white;")
-        middle_layout.addWidget(middle_label)
-
-        # content_row.addWidget(middle_frame, stretch=1)  # 👈 NEW PANEL
         content_row.addWidget(left_frame, stretch=1)
        
         content_row.addWidget(right_frame, stretch=1)
@@ -546,6 +533,7 @@ class Ui_MainWindow(object):
 
         self.toolbar_buttons = {}
         icon_map = {
+            # "Add Download": ":/icons/add.svg",
             "Resume": ":/icons/play.svg",
             "Pause": ":/icons/pause.svg",
             "Stop All": ":/icons/stop_all.svg",
@@ -556,7 +544,8 @@ class Ui_MainWindow(object):
             "Schedule All": ":/icons/sche.png",
             "Settings": ":/icons/setting.svg",
             "Download Window": ":/icons/d_window.png",
-            "Queues": ":/icons/queues.png"
+            "Queues": ":/icons/queues.png",
+            "Whats New": ':/icons/sparkling.png'
             
         }
 
@@ -708,7 +697,7 @@ class Ui_MainWindow(object):
         self.log_level_label.setStyleSheet("color: white; font-size: 12px;")
 
         self.log_level_combo = QComboBox()
-        self.log_level_combo.addItems(["1", "2", "3"])
+        self.log_level_combo.addItems(["1", "2", "3", "4"])
         self.log_level_combo.setStyleSheet("""
             QComboBox {
                 background-color: #2b2b2b;

@@ -36,6 +36,7 @@ from typing import Any
 from pathlib import Path
 from collections import deque
 from threading import Thread, Timer
+from typing import Callable, Optional
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote, parse_qs, urlencode, urlunparse
 
@@ -55,6 +56,7 @@ from ui.ui_main import Ui_MainWindow
 from ui.about_dialog import AboutDialog
 from ui.queue_dialog import QueueDialog
 from ui.tray_icon import TrayIconManager
+from ui.changelog_diaglog import WhatsNew
 from ui.setting_dialog import SettingsWindow
 from ui.download_window import DownloadWindow
 from ui.schedule_dialog import ScheduleDialog
@@ -68,7 +70,7 @@ from modules.downloaditem import DownloadItem
 from modules.aria2c_manager import aria2c_manager
 from modules.settings_manager import SettingsManager
 from modules import config, brain, setting, video, update, setting
-from modules.video import (Video, check_ffmpeg, download_ffmpeg, download_aria2c)
+from modules.video import (Video, check_ffmpeg, check_deno, download_deno, download_ffmpeg, download_aria2c)
 from modules.utils import (size_format, validate_file_name, compare_versions, compare_versions_2, log, time_format,
     notify, run_command, handle_exceptions, get_machine_id)
 from modules.helper import (toolbar_buttons_state, get_msgbox_style, change_cursor, show_information,
@@ -285,6 +287,19 @@ class CheckUpdateAppThread(QThread):
             
         change_cursor('normal') # Revert cursor to normal
         setting.save_setting()
+
+
+
+class YtDlpUpdateThread(QThread):
+    """
+    Thread to perform yt-dlp update and signal when it is finished.
+    """
+    update_finished = Signal(bool, str)  # Signal to indicate that the update is finished
+
+    def run(self):
+        """Run the yt-dlp update process and emit the signal when finished."""
+        success, message = update.update_yt_dlp()  # Perform the yt-dlp update here
+        self.update_finished.emit(success, message)  # Emit the signal when done
 
     
 class UpdateThread(QThread):
@@ -769,6 +784,7 @@ class DownloadManagerUI(QMainWindow):
         widgets.help_menu.actions()[3].triggered.connect(self.show_visual_tutorial)
         widgets.help_menu.actions()[4].triggered.connect(self.open_github_issues)
         widgets.toolbar_buttons["Queues"].clicked.connect(self.show_queue_dialog)
+        widgets.toolbar_buttons["Whats New"].clicked.connect(self.show_changelog_dialog)
 
 
         self.update_gui_signal.connect(self.process_gui_updates)
@@ -793,6 +809,7 @@ class DownloadManagerUI(QMainWindow):
         self.scheduler_timer = QTimer(self)
         self.scheduler_timer.timeout.connect(self.check_scheduled_queues)
         self.scheduler_timer.start(60000)  # Every 60 seconds
+        self.apply_pending_yt_dlp_update_on_startup()
     
 
     def show_visual_tutorial(self):
@@ -979,7 +996,8 @@ class DownloadManagerUI(QMainWindow):
             "Spanish": "app_es",
             "Chinese": "app_zh",
             "Korean":  "app_ko",
-            "Japanese":"app_ja",
+            "Japanese": "app_ja.qm",
+            "Hindi":"app_hi.qm"
         }
         target_stem = file_map.get(language)
         if not target_stem:
@@ -1152,7 +1170,7 @@ class DownloadManagerUI(QMainWindow):
             # Enable only global buttons
             for key in widgets.toolbar_buttons:
                 widgets.toolbar_buttons[key].setEnabled(key in {
-                    "Stop All", "Resume All", "Settings", "Schedule All", "Queues",
+                    "Stop All", "Resume All", "Settings", "Schedule All", "Queues","Whats New"
                 })
             return
 
@@ -1247,6 +1265,8 @@ class DownloadManagerUI(QMainWindow):
                 self._queue_or_start_download(*v)
             elif k == "update call":
                 self.start_update(*v)
+            elif k == "yt-dlp update call":
+                self.start_update_yt_dlp(*v)
 
 
     def run(self):
@@ -1410,6 +1430,12 @@ class DownloadManagerUI(QMainWindow):
         new_query = urlencode(clean_query, doseq=True)
         cleaned_url = urlunparse(parsed._replace(query=new_query))
         return cleaned_url
+    
+    def is_youtube_url(self, url: str) -> bool:
+        netloc = urlparse(url).netloc.lower()
+        return any(netloc.endswith(d) for d in (
+            'youtube.com', 'youtu.be', 'music.youtube.com'
+        ))
 
     def url_text_change(self):
         """Handle URL changes in the QLineEdit."""
@@ -1419,9 +1445,27 @@ class DownloadManagerUI(QMainWindow):
 
         if url == self.d.url:
             return
+
+        if self.is_youtube_url(url):
+            ok = self.ensure_dependency(
+                name="Deno",
+                check_func=check_deno,           # existing check
+                download_func=download_deno,     # downloader/installer
+                recommended_dir=config.global_sett_folder,
+                local_dir=config.current_directory,
+                non_windows_msg=self.tr(
+                    '"Deno" is required to solve JavaScript challenges for YouTube.\n'
+                    "Install from the official docs or add the deno executable to PATH."
+                    "Run this command 'curl -fsSL https://deno.land/install.sh | sh' to install it."
+                ),
+            )
+            if not ok:
+                # Abort gracefully; user cancelled or install failed
+                return
         
 
         self.reset()
+
         try:
             self.d.eff_url = self.d.url = url
             log(f"New URL set: {url}", log_level=1)
@@ -1684,8 +1728,24 @@ class DownloadManagerUI(QMainWindow):
         
         # check for ffmpeg availability in case this is a dash video
         if d.type == 'dash' or 'm3u8' in d.protocol:
+
+            if not self.d.ext:
+                self.d.ext = self.extract_ext_from_url(self.d.url, self.d)
+                
             # log('Dash video detected')
-            if not self.ffmpeg_check():
+            ok = self.ensure_dependency(name="FFmpeg", 
+                check_func=check_ffmpeg, 
+                download_func=download_ffmpeg, 
+                recommended_dir=config.global_sett_folder, 
+                local_dir=config.current_directory,
+                non_windows_msg=self.tr(
+                    '"ffmpeg" is required to merge an audio stream with your video.\n'
+                    f'Executable must be found at {config.ffmpeg_actual_path_2} or added to PATH.\n'
+                    "On Linux: sudo apt-get update && sudo apt-get install ffmpeg\n"
+                    "On macOS: brew install ffmpeg"
+                ),
+            )
+            if not ok:
                 log('Download cancelled, FFMPEG is missing', log_level=2)
                 return 'cancelled'
 
@@ -2387,135 +2447,272 @@ class DownloadManagerUI(QMainWindow):
 
     # region Add-ons Check
 
-    def ffmpeg_check(self):
-        """Check if ffmpeg is available, if not, prompt user to download."""
+    def ensure_dependency(
+        self,
+        *,
+        name: str,                                 # e.g. "FFmpeg" or "Deno"
+        check_func: Callable[[], bool],            # e.g. check_ffmpeg, check_deno
+        download_func: Callable[[str], None],      # e.g. download_ffmpeg(dest), download_deno(dest)
+        recommended_dir: Optional[str] = None,     # e.g. config.global_sett_folder
+        local_dir: Optional[str] = None,           # e.g. config.current_directory
+        missing_title: Optional[str] = None,       # dialog title on Windows
+        missing_label: Optional[str] = None,       # main label on Windows
+        non_windows_msg: Optional[str] = None,     # messagebox text on non-Windows
+    ) -> bool:
+        """
+        Ensure `name` is available. If not, on Windows show a themed download dialog;
+        on other OSes show a guidance MessageBox. Returns True if available/installed, else False.
+        """
+
+        # Already present?
+        try:
+            if check_func():
+                return True
+        except Exception:
+            # If your check function can raise, treat as missing
+            pass
+
+        # Defaults for text
+        title = missing_title or self.tr(f'{name} is missing')
+        label_text = missing_label or self.tr(f'"{name}" is missing and needs to be downloaded:')
+        nonwin_text = non_windows_msg or self.tr(
+            f'"{name}" is required for this action.\n'
+            f'Please install {name} with your OS package manager or provide its path in the app settings.'
+        )
+
+        # Windows: show the styled download dialog just like your ffmpeg flow
+        if getattr(config, 'operating_system', '').lower() == 'windows':
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #0F1B14,
+                        stop: 1 #050708
+                    );
+                    color: white;
+                    border-radius: 14px;
+                }
+                QLabel { color: white; font-size: 12px; }
+                QRadioButton { padding: 4px; }
+            """)
+
+            layout = QVBoxLayout(dialog)
+
+            label = QLabel(label_text)
+            layout.addWidget(label)
+
+            # Destination choices (fall back to current dir if recommended/local not provided)
+            rec_dir = recommended_dir or getattr(config, 'global_sett_folder', getattr(config, 'current_directory', '.'))
+            loc_dir = local_dir or getattr(config, 'current_directory', '.')
+
+            recommended = self.tr("Recommended:")
+            local_fd = self.tr("Local folder:")
+            recommended_radio = QRadioButton(f"{recommended} {rec_dir}")
+            recommended_radio.setChecked(True)
+            local_radio = QRadioButton(f"{local_fd} {loc_dir}")
+
+            radio_group = QButtonGroup(dialog)
+            radio_group.addButton(recommended_radio)
+            radio_group.addButton(local_radio)
+
+            radio_layout = QVBoxLayout()
+            radio_layout.addWidget(recommended_radio)
+            radio_layout.addWidget(local_radio)
+            layout.addLayout(radio_layout)
+
+            # Buttons
+            button_layout = QHBoxLayout()
+            download_button = QPushButton(self.tr('Download'))
+            download_button.setStyleSheet("""
+                QPushButton {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #0F1B14,
+                        stop: 1 #050708
+                    );
+                    color: white; border: none; border-radius: 6px;
+                    padding: 6px 16px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #33d47c; }
+            """)
+            cancel_button = QPushButton(self.tr('Cancel'))
+            cancel_button.setStyleSheet("""
+                QPushButton {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #0F1B14,
+                        stop: 1 #050708
+                    );
+                    color: white; border: none; border-radius: 6px;
+                    padding: 6px 16px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #3c3c3c; }
+            """)
+            button_layout.addWidget(download_button)
+            button_layout.addWidget(cancel_button)
+            layout.addLayout(button_layout)
+            dialog.setLayout(layout)
+
+            def on_download():
+                dest = rec_dir if recommended_radio.isChecked() else loc_dir
+                try:
+                    download_func(dest)
+                finally:
+                    dialog.accept()
+
+            def on_cancel():
+                dialog.reject()
+
+            download_button.clicked.connect(on_download)
+            cancel_button.clicked.connect(on_cancel)
+
+            ok = dialog.exec()
+            if not ok:
+                return False
+
+            # Re-check after attempted install
+            try:
+                return bool(check_func())
+            except Exception:
+                return False
+
+        # Non-Windows: show guidance
+        QMessageBox.critical(self, title, nonwin_text)
+        return False
+
+
+
+    # def ffmpeg_check(self):
+    #     """Check if ffmpeg is available, if not, prompt user to download."""
         
-        if not check_ffmpeg():
-            if config.operating_system == 'Windows':
-                # Create the dialog
-                dialog = QDialog(self)
-                dialog.setWindowTitle(self.tr('FFmpeg is missing'))
-                dialog.setStyleSheet("""
-                    QDialog {
-                        background-color: qlineargradient(
-                            x1: 0, y1: 0, x2: 1, y2: 1,
-                            stop: 0 #0F1B14,
-                            stop: 1 #050708
-                        );
-                        color: white;
-                        border-radius: 14px;
-                    }
-                    QLabel {
-                        color: white;
-                        font-size: 12px;
-                    }
-                    QRadioButton {
-                        padding: 4px;
-                    }
+    #     if not check_ffmpeg():
+    #         if config.operating_system == 'Windows':
+    #             # Create the dialog
+    #             dialog = QDialog(self)
+    #             dialog.setWindowTitle(self.tr('FFmpeg is missing'))
+    #             dialog.setStyleSheet("""
+    #                 QDialog {
+    #                     background-color: qlineargradient(
+    #                         x1: 0, y1: 0, x2: 1, y2: 1,
+    #                         stop: 0 #0F1B14,
+    #                         stop: 1 #050708
+    #                     );
+    #                     color: white;
+    #                     border-radius: 14px;
+    #                 }
+    #                 QLabel {
+    #                     color: white;
+    #                     font-size: 12px;
+    #                 }
+    #                 QRadioButton {
+    #                     padding: 4px;
+    #                 }
                     
-                """)
+    #             """)
 
-                # Layout setup
-                layout = QVBoxLayout(dialog)
+    #             # Layout setup
+    #             layout = QVBoxLayout(dialog)
 
-                # Label for missing FFmpeg
-                label = QLabel(self.tr('"ffmpeg" is missing!! and needs to be downloaded:'))
-                layout.addWidget(label)
+    #             # Label for missing FFmpeg
+    #             label = QLabel(self.tr('"ffmpeg" is missing!! and needs to be downloaded:'))
+    #             layout.addWidget(label)
 
-                # Radio buttons for choosing destination folder
-                recommended, local_fd = self.tr("Recommended:"), self.tr("Local folder:")
-                recommended_radio = QRadioButton(f"{recommended} {config.global_sett_folder}")
-                recommended_radio.setChecked(True)
-                local_radio = QRadioButton(f"{local_fd} {config.current_directory}")
+    #             # Radio buttons for choosing destination folder
+    #             recommended, local_fd = self.tr("Recommended:"), self.tr("Local folder:")
+    #             recommended_radio = QRadioButton(f"{recommended} {config.global_sett_folder}")
+    #             recommended_radio.setChecked(True)
+    #             local_radio = QRadioButton(f"{local_fd} {config.current_directory}")
 
-                # Group radio buttons
-                radio_group = QButtonGroup(dialog)
-                radio_group.addButton(recommended_radio)
-                radio_group.addButton(local_radio)
+    #             # Group radio buttons
+    #             radio_group = QButtonGroup(dialog)
+    #             radio_group.addButton(recommended_radio)
+    #             radio_group.addButton(local_radio)
 
-                # Layout for radio buttons
-                radio_layout = QVBoxLayout()
-                radio_layout.addWidget(recommended_radio)
-                radio_layout.addWidget(local_radio)
+    #             # Layout for radio buttons
+    #             radio_layout = QVBoxLayout()
+    #             radio_layout.addWidget(recommended_radio)
+    #             radio_layout.addWidget(local_radio)
 
-                layout.addLayout(radio_layout)
+    #             layout.addLayout(radio_layout)
 
-                # Buttons for Download and Cancel
-                button_layout = QHBoxLayout()
-                download_button = QPushButton(self.tr('Download'))
-                download_button.setStyleSheet("""
-                    QPushButton {
-                        background-color: qlineargradient(
-                        x1: 0, y1: 0, x2: 1, y2: 1,
-                        stop: 0 #0F1B14,
-                        stop: 1 #050708
-                        ); 
-                        color: white;
-                        border: none;
-                        border-radius: 6px;
-                        padding: 6px 16px;
-                        font-weight: bold;
-                    }
-                    QPushButton:hover {
-                        background-color: #33d47c;
-                    }
-                """)
-                cancel_button = QPushButton(self.tr('Cancel'))
-                cancel_button.setStyleSheet("""
-                    QPushButton {
-                        background-color: qlineargradient(
-                        x1: 0, y1: 0, x2: 1, y2: 1,
-                        stop: 0 #0F1B14,
-                        stop: 1 #050708
-                        ); 
-                        color: white;
-                        border: none;
-                        border-radius: 6px;
-                        padding: 6px 16px;
-                        font-weight: bold;
-                    }
-                    QPushButton:hover {
-                        background-color: #3c3c3c;
-                    }
-                """)
-                button_layout.addWidget(download_button)
-                button_layout.addWidget(cancel_button)
+    #             # Buttons for Download and Cancel
+    #             button_layout = QHBoxLayout()
+    #             download_button = QPushButton(self.tr('Download'))
+    #             download_button.setStyleSheet("""
+    #                 QPushButton {
+    #                     background-color: qlineargradient(
+    #                     x1: 0, y1: 0, x2: 1, y2: 1,
+    #                     stop: 0 #0F1B14,
+    #                     stop: 1 #050708
+    #                     ); 
+    #                     color: white;
+    #                     border: none;
+    #                     border-radius: 6px;
+    #                     padding: 6px 16px;
+    #                     font-weight: bold;
+    #                 }
+    #                 QPushButton:hover {
+    #                     background-color: #33d47c;
+    #                 }
+    #             """)
+    #             cancel_button = QPushButton(self.tr('Cancel'))
+    #             cancel_button.setStyleSheet("""
+    #                 QPushButton {
+    #                     background-color: qlineargradient(
+    #                     x1: 0, y1: 0, x2: 1, y2: 1,
+    #                     stop: 0 #0F1B14,
+    #                     stop: 1 #050708
+    #                     ); 
+    #                     color: white;
+    #                     border: none;
+    #                     border-radius: 6px;
+    #                     padding: 6px 16px;
+    #                     font-weight: bold;
+    #                 }
+    #                 QPushButton:hover {
+    #                     background-color: #3c3c3c;
+    #                 }
+    #             """)
+    #             button_layout.addWidget(download_button)
+    #             button_layout.addWidget(cancel_button)
 
-                layout.addLayout(button_layout)
+    #             layout.addLayout(button_layout)
 
-                # Set layout and show the dialog
-                dialog.setLayout(layout)
+    #             # Set layout and show the dialog
+    #             dialog.setLayout(layout)
 
-                # Handle button actions
-                def on_download():
-                    selected_folder = config.global_sett_folder if recommended_radio.isChecked() else config.current_directory
-                    download_ffmpeg(destination=selected_folder)
-                    dialog.accept()  # Close the dialog after download
+    #             # Handle button actions
+    #             def on_download():
+    #                 selected_folder = config.global_sett_folder if recommended_radio.isChecked() else config.current_directory
+    #                 download_ffmpeg(destination=selected_folder)
+    #                 dialog.accept()  # Close the dialog after download
 
-                def on_cancel():
-                    dialog.reject()  # Close dialog on cancel
+    #             def on_cancel():
+    #                 dialog.reject()  # Close dialog on cancel
 
-                # Connect button signals
-                download_button.clicked.connect(on_download)
-                cancel_button.clicked.connect(on_cancel)
+    #             # Connect button signals
+    #             download_button.clicked.connect(on_download)
+    #             cancel_button.clicked.connect(on_cancel)
 
-                # Execute the dialog
-                dialog.exec()
+    #             # Execute the dialog
+    #             dialog.exec()
 
-            else:
-                # Show error popup for non-Windows systems
-                s2 = self.tr('"ffmpeg" is required to merge an audio stream with your video.')
-                s3, s3a = self.tr('Executable must be found at'), self.tr("folder or add the ffmpeg path to system PATH.")
-                s4 = self.tr("Please do 'sudo apt-get update' and 'sudo apt-get install ffmpeg' on Linux or 'brew install ffmpeg' on MacOS.")
-                QMessageBox.critical(self, 
-                                    self.tr('FFmpeg is missing'),
-                                    f'{s2} \n'
-                                    f'{s3} {config.ffmpeg_folder_path} {s3a} \n'
-                                    f"{s4}")
+    #         else:
+    #             # Show error popup for non-Windows systems
+    #             s2 = self.tr('"ffmpeg" is required to merge an audio stream with your video.')
+    #             s3, s3a = self.tr('Executable must be found at'), self.tr("folder or add the ffmpeg path to system PATH.")
+    #             s4 = self.tr("Please do 'sudo apt-get update' and 'sudo apt-get install ffmpeg' on Linux or 'brew install ffmpeg' on MacOS.")
+    #             QMessageBox.critical(self, 
+    #                                 self.tr('FFmpeg is missing'),
+    #                                 f'{s2} \n'
+    #                                 f'{s3} {config.ffmpeg_folder_path} {s3a} \n'
+    #                                 f"{s4}")
 
-            return False
-        else:
-            return True
+    #         return False
+    #     else:
+    #         return True
         
 
     def aria2c_check(self):
@@ -2634,7 +2831,7 @@ class DownloadManagerUI(QMainWindow):
             self.show_message("Error", "aria2c is already installed.")
             s2 = self.tr('"aria2c" is required to download files.')
             s3, s3a = self.tr('Executable must be found at'), self.tr("folder or add the aria2c path to system PATH.")
-            s4 = self.tr("Please do 'sudo apt-get update' and 'sudo apt-get install aria2' on Linux or 'brew install aria2' on MacOS.")
+            s4 = self.tr('Please do sudo apt-get update and sudo apt-get install aria2 on Linux or brew install aria2 on MacOS.')
             QMessageBox.critical(self,
                                 self.tr('aria2c is missing'),
                                 f'{s2} \n'
@@ -3461,6 +3658,10 @@ class DownloadManagerUI(QMainWindow):
         self.ui_queues.d_list = self.d_list  # Update d_list for the dialog
         self.ui_queues.populate_queue_items()
         self.ui_queues.exec() # Show the existing instance
+    
+    def show_changelog_dialog(self):
+        dialog = WhatsNew(parent=self)
+        dialog.exec()
 
     # endregion
 
@@ -4197,7 +4398,7 @@ class DownloadManagerUI(QMainWindow):
 
     
     def _start_ffmpeg_remerge(self, d, video_path: str, audio_path: str, output_path: str, row_index: int):
-        ffmpeg = config.get_ffmpeg_path()
+        ffmpeg = config.ffmpeg_actual_path
         if not ffmpeg or not os.path.exists(ffmpeg):
             show_warning(self.tr("FFmpeg not found"), self.tr("Please install or configure FFmpeg in Settings."))
             return
@@ -4668,6 +4869,46 @@ class DownloadManagerUI(QMainWindow):
         self.start_update_thread.app_update.connect(self.update_app)
         self.start_update_thread.start()
 
+    def start_update_yt_dlp(self):
+        self.yt_dlp_update_thread = YtDlpUpdateThread()
+        self.yt_dlp_update_thread.update_finished.connect(self.on_yt_dlp_update_finished)
+        self.yt_dlp_update_thread.start()
+        self.background_threads.append(self.yt_dlp_update_thread)
+        self.change_page(btn=None, btnName=None, idx=2)
+
+
+    def on_yt_dlp_update_finished(self, success, message):
+        log("yt-dlp update finished")
+        if success:
+            show_information(title=self.tr("yt-dlp Update"), inform="", msg=self.tr("yt-dlp has been updated to the latest version."))
+            if sys.platform.startswith('linux') or sys.platform == 'darwin':
+                # On Linux and macOS, we can apply the update immediately
+                show_information(title=self.tr('yt-dlp Update'), inform='', msg=self.tr(f"On Unix run: chmod 777 \n {config.yt_dlp_actual_path}"))
+        else:
+            show_warning(title=self.tr("yt-dlp Update Error"), msg=message or self.tr("yt-dlp update failed or is already up to date."))
+        self.change_page(btn=None, btnName=None, idx=0)
+    
+
+    def apply_pending_yt_dlp_update_on_startup(self):
+        yt_dlp_path = getattr(config, "yt_dlp_exe", "") or ""
+        if not yt_dlp_path:
+            return False, "No yt-dlp path configured."
+
+        target_exe = Path(yt_dlp_path)
+        pending_exe = target_exe.with_suffix('.exe.new')
+
+        if pending_exe.exists():
+            try:
+                # attempt atomic replace
+                os.replace(str(pending_exe), str(target_exe))
+                log("Applied pending yt-dlp update on startup.", log_level=1)
+                show_information(title=self.tr('yt-dlp Update'), inform='', msg=self.tr('yt-dlp has been updated to the latest version.'))
+            except Exception as e:
+                # If it fails, leave the .exe.new in place for next restart
+                log(f"Failed to apply pending yt-dlp update on startup: {e}", log_level=3)
+                show_critical(title=self.tr('yt-dlp Update Error', self.tr(f'Failed to apply pending update: {e}')))
+        return False, "No pending yt-dlp update."
+
     def update_app(self, new_version_available):
         """Show changelog with latest version and ask user for update."""
         if new_version_available:
@@ -4827,7 +5068,7 @@ def ask_for_sched_time(msg=''):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(":/icons/logo1.png"))
+    app.setWindowIcon(QIcon(":/icons/omnipull.png"))
     app_id = "omnipull"
     single_instance = SingleInstanceApp(app_id)
 

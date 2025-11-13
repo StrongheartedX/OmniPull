@@ -21,17 +21,21 @@ import os
 import re
 import sys
 import copy
+import json
+import math
 import time
 import shlex
 import shutil
 import asyncio
 import zipfile
+import requests
+import platform
 import subprocess
-from pathlib import Path
 from modules import config
+from typing import Dict, Any
 from urllib.parse import urljoin
 from modules.threadpool import executor
-from modules.config import get_ffmpeg_path
+from modules.config import get_effective_ffmpeg
 from modules.downloaditem import DownloadItem, Segment
 from modules.utils import log, validate_file_name, get_headers, size_format, run_command, \
     delete_file, download, process_thumbnail, popup, delete_folder
@@ -63,10 +67,14 @@ def get_ytdl_options():
         'prefer_insecure': True, 
         'no_warnings': config.ytdlp_config.get('no_warnings', True),
         'logger': Logger(),
-        'format': 'bv*+ba/best',
+        'formats': 'bv*+ba/best',
         'listformats': config.ytdlp_config.get('list_formats', False),
         'noplaylist': config.ytdlp_config.get('no_playlist', True),
-        'ignore_errors': config.ytdlp_config.get('ignore_errors', True)
+        'ignoreerrors': config.ytdlp_config.get('ignore_errors', True),
+        'cookies': config.ytdlp_config['cookiesfile'],
+        'verbose': True,
+
+
         
     }
     if config.proxy != "":
@@ -84,10 +92,542 @@ def get_ytdl_options():
     return ydl_opts
 
 
-def extract_info_blocking(url, ydl_opts):
+
+
+
+
+# def extract_info_blocking(url, ydl_opts):
+#     import yt_dlp as ytdl
+#     with ytdl.YoutubeDL(ydl_opts) as ydl:
+#         return ydl.extract_info(url, download=False, process=True)
+    
+def _ydl_opts_to_args(ydl_opts: dict, allow_listformats: bool = False) -> list[str]:
+    """
+    Convert ydl_opts to CLI args. If allow_listformats is False, do not emit --list-formats
+    because it prints human output and breaks --dump-single-json.
+    """
+    args = []
+
+    # Cookie file
+    cookiefile = ydl_opts.get("cookiefile") or ydl_opts.get("cookies") or ydl_opts.get("cookiesfile")
+    if cookiefile:
+        args += ["--cookies", str(cookiefile)]
+
+    # Proxy
+    if ydl_opts.get("proxy"):
+        args += ["--proxy", str(ydl_opts["proxy"])]
+
+    # No warnings
+    if ydl_opts.get("no_warnings", False):
+        args.append("--no-warnings")
+
+    # Ignore errors
+    if ydl_opts.get("ignore_errors", False):
+        args.append("--ignore-errors")
+
+    # Playlist handling
+    if ydl_opts.get("noplaylist", False) or ydl_opts.get("no_playlist", False):
+        args.append("--no-playlist")
+
+    # List formats: only add if explicitly allowed (we won't allow it when requesting JSON)
+    if allow_listformats and ydl_opts.get("listformats", False):
+        args.append("--list-formats")
+
+    # Formats / format
+    fmt = ydl_opts.get("formats") or ydl_opts.get("formats")
+    if fmt:
+        args += ["-f", str(fmt)]
+
+    # Prefer insecure
+    if ydl_opts.get("prefer_insecure", False):
+        args.append("--prefer-insecure")
+
+    return args
+
+# Helper: turn bytes into human-readable size
+def _human_filesize(num_bytes):
+    try:
+        if num_bytes is None:
+            return ""
+        n = float(num_bytes)
+    except Exception:
+        return ""
+    if n <= 0:
+        return ""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = int(math.floor(math.log(n, 1024)))
+    idx = min(idx, len(units) - 1)
+    value = n / (1024 ** idx)
+    # show one decimal for >=KB
+    if idx == 0:
+        return f"{int(value)}{units[idx]}"
+    else:
+        return f"{value:.1f}{units[idx]}"
+
+# ANSI color helpers
+class Colors:
+    HEADER = "\033[95m"
+    OKBLUE = "\033[94m"
+    OKCYAN = "\033[96m"
+    OKGREEN = "\033[92m"
+    WARNING = "\033[93m"
+    FAIL = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+
+def formats_to_table_html(info: dict) -> str:
+    formats = info.get("formats", [])
+    if not formats:
+        return '<span style="color: orange;">[yt-dlp] No formats available</span>'
+
+    header = (
+        f"<b>{'ID':<8}{'EXT':<6}{'RES':<10}{'FPS':<5}{'VCODEC':<15}{'ACODEC':<10}{'SIZE':<10}{'TBR':<6}</b>"
+    )
+    lines = [header, "-" * 80]
+
+    for f in formats:
+        fid = f.get("format_id", "")
+        ext = f.get("ext", "")
+        res = f.get("resolution", "") or f"{f.get('width', '')}x{f.get('height', '')}"
+        fps = str(f.get("fps", "")) if f.get("fps") else ""
+        vcodec = f.get("vcodec", "unknown")
+        acodec = f.get("acodec", "unknown")
+        size = f.get("filesize") or f.get("filesize_approx") or ""
+        if isinstance(size, int):
+            size = f"{size/1024/1024:.1f}MiB"
+        tbr = str(f.get("tbr", ""))
+
+        line = (
+            f"{fid:<8}"
+            f"<span style='color: teal;'>{ext:<6}</span>"
+            f"{res:<10}{fps:<5}"
+            f"<span style='color: green;'>{vcodec:<15}</span>"
+            f"<span style='color: green;'>{acodec:<10}</span>"
+            f"<span style='color: blue;'>{size:<10}</span>"
+            f"{tbr:<6}"
+        )
+        lines.append(line)
+
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
+
+
+def _run_ytdlp_python_api(url: str, ydl_opts: dict):
     import yt_dlp as ytdl
-    with ytdl.YoutubeDL(ydl_opts) as ydl:
+    safe_opts = dict(ydl_opts)
+    safe_opts.pop("logger", None)
+    with ytdl.YoutubeDL(safe_opts) as ydl:
         return ydl.extract_info(url, download=False, process=True)
+
+
+
+
+
+
+def extract_info_blocking(url: str, ydl_opts: dict = None, exe_timeout: float = 15.0):
+    """
+    Extract info for `url` using either the configured standalone exe or the Python API.
+
+    If listformats=True in ydl_opts:
+      - prefer Python API (structured formats)
+      - log() the human-readable formats table in addition to returning JSON
+    """
+    if ydl_opts is None:
+        ydl_opts = get_ytdl_options()
+
+    wants_listformats = bool(ydl_opts.get("listformats", False))
+
+    # -----------------------
+    # Executable path
+    # -----------------------
+    if config.get_effective_ytdlp() and getattr(config, "use_ytdlp_exe", False):
+        exe_path = config.get_effective_ytdlp()
+        if not exe_path or not os.path.isfile(exe_path):
+            raise FileNotFoundError(f"yt-dlp executable not found: {exe_path}")
+
+        if wants_listformats:
+            # Force Python API instead so we can pretty-print formats
+            log("[yt-dlp.exe] Using Python API for listformats")
+            info = _run_ytdlp_python_api(url, ydl_opts)
+            log(formats_to_table_html(info))   # dump the table to your custom log
+            return info
+
+        # Normal JSON extraction via exe
+        cli_args = _ydl_opts_to_args(ydl_opts, allow_listformats=False)
+        forced = ["--dump-single-json", "--no-warnings", "--no-progress"]
+        cmd = [exe_path] + cli_args + forced + [url]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=exe_timeout)
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+
+        if stdout:
+            try:
+                return json.loads(stdout)
+            except json.JSONDecodeError:
+                pass
+
+        # salvage JSON if mixed output
+        combined = stdout + "\n" + stderr
+        first_lbrace = combined.find("{")
+        last_rbrace = combined.rfind("}")
+        if first_lbrace != -1 and last_rbrace > first_lbrace:
+            try:
+                return json.loads(combined[first_lbrace:last_rbrace + 1])
+            except json.JSONDecodeError:
+                pass
+
+        raise RuntimeError(
+            f"yt-dlp executable did not return valid JSON.\n"
+            f"Exit code: {proc.returncode}\n"
+            f"Command: {shlex.join(cmd)}\n"
+            f"Stdout:\n{stdout[:500]}\n\nStderr:\n{stderr[:500]}"
+        )
+
+    # -----------------------
+    # Python API fallback
+    # -----------------------
+    log("[yt-dlp] Using Python API")
+    info = _run_ytdlp_python_api(url, ydl_opts)
+
+    if wants_listformats:
+        log(formats_to_table_html(info))
+
+    return info
+
+#####################################################################################
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#   © 2024 Emmanuel Gyimah Annor. All rights reserved.
+#####################################################################################
+
+
+import os
+import re
+import sys
+import copy
+import json
+import math
+import time
+import shlex
+import shutil
+import asyncio
+import zipfile
+import platform
+import subprocess
+from pathlib import Path
+from modules import config
+from typing import Dict, Any
+from urllib.parse import urljoin
+from modules.threadpool import executor
+from modules.config import get_effective_ffmpeg
+from modules.downloaditem import DownloadItem, Segment
+from modules.utils import log, validate_file_name, get_headers, size_format, run_command, \
+    delete_file, download, process_thumbnail, popup, delete_folder
+
+
+# yt-dlp
+ytdl = None  # yt-dlp will be imported in a separate thread to save loading time
+
+
+class Logger(object):
+    """used for capturing yt-dlp stdout/stderr output"""
+
+    def debug(self, msg):
+        log(msg)
+
+    def error(self, msg):
+        log(msg)
+
+    def warning(self, msg):
+        log(msg)
+
+    def __repr__(self):
+        return "yt-dlp Logger"
+
+
+def get_ytdl_options():
+    ydl_opts = {
+        'prefer_insecure': True, 
+        'no_warnings': config.ytdlp_config.get('no_warnings', True),
+        'logger': Logger(),
+        'formats': 'bv*+ba/best',
+        'listformats': config.ytdlp_config.get('list_formats', False),
+        'noplaylist': config.ytdlp_config.get('no_playlist', True),
+        'ignoreerrors': config.ytdlp_config.get('ignore_errors', True),
+        'cookies': config.ytdlp_config['cookiesfile'],
+        'verbose': True,
+        'js_runtimes': {
+           'deno': {
+                'executable': config.get_effective_deno()
+            },
+            # Optional fallbacks (use PATH if you omit 'executable'):
+            # 'node': {},
+            # 'quickjs': {},
+            # 'bun': {},
+        },
+    
+
+
+        
+    }
+    if config.proxy != "":
+        proxy_url = config.proxy
+        if config.proxy_user and config.proxy_pass:
+            # Inject basic auth into the proxy URL
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(proxy_url)
+            proxy_url = urlunparse(parsed._replace(netloc=f"{config.proxy_user}:{config.proxy_pass}@{parsed.hostname}:{parsed.port}"))
+
+        ydl_opts['proxy'] = proxy_url
+
+    ydl_opts['no_playlist'] = True
+
+    return ydl_opts
+
+
+
+
+
+
+# def extract_info_blocking(url, ydl_opts):
+#     import yt_dlp as ytdl
+#     with ytdl.YoutubeDL(ydl_opts) as ydl:
+#         return ydl.extract_info(url, download=False, process=True)
+    
+def _format_js_runtimes_cli(jsr) -> str | None:
+    # Accept dict (API-style), list/tuple (preformatted), or string (already CLI-style)
+    if isinstance(jsr, dict):
+        parts = []
+        for name, cfg in jsr.items():
+            exe = None
+            if isinstance(cfg, dict):
+                exe = cfg.get('executable') or cfg.get('path')
+            if exe:
+                parts.append(f"{name}:{exe}")
+            else:
+                parts.append(name)
+        return ",".join(parts) if parts else None
+    if isinstance(jsr, (list, tuple)):
+        return ",".join(str(x) for x in jsr) if jsr else None
+    if isinstance(jsr, str):
+        return jsr or None
+    return None
+
+    
+def _ydl_opts_to_args(ydl_opts: dict, allow_listformats: bool = False) -> list[str]:
+    """
+    Convert ydl_opts to CLI args. If allow_listformats is False, do not emit --list-formats
+    because it prints human output and breaks --dump-single-json.
+    """
+    args = []
+
+    # Cookie file
+    cookiefile = ydl_opts.get("cookiefile") or ydl_opts.get("cookies") or ydl_opts.get("cookiesfile")
+    if cookiefile:
+        args += ["--cookies", str(cookiefile)]
+
+    # Proxy
+    if ydl_opts.get("proxy"):
+        args += ["--proxy", str(ydl_opts["proxy"])]
+
+    # No warnings
+    if ydl_opts.get("no_warnings", False):
+        args.append("--no-warnings")
+
+    # Ignore errors
+    if ydl_opts.get("ignore_errors", False):
+        args.append("--ignore-errors")
+
+    # Playlist handling
+    if ydl_opts.get("noplaylist", False) or ydl_opts.get("no_playlist", False):
+        args.append("--no-playlist")
+
+    # List formats: only add if explicitly allowed (we won't allow it when requesting JSON)
+    if allow_listformats and ydl_opts.get("listformats", False):
+        args.append("--list-formats")
+
+    # Formats / format
+    fmt = ydl_opts.get("format") or ydl_opts.get("formats")
+    if fmt:
+        args += ["-f", str(fmt)]
+
+    # Prefer insecure
+    if ydl_opts.get("prefer_insecure", False):
+        args.append("--prefer-insecure")
+
+    # JS runtimes (Deno/Node/QuickJS/Bun)
+    jsr = ydl_opts.get("js_runtimes")
+    cli_jsr = _format_js_runtimes_cli(jsr)
+    if cli_jsr:
+        args += ["--js-runtimes", cli_jsr]
+
+    return args
+
+# Helper: turn bytes into human-readable size
+def _human_filesize(num_bytes):
+    try:
+        if num_bytes is None:
+            return ""
+        n = float(num_bytes)
+    except Exception:
+        return ""
+    if n <= 0:
+        return ""
+    units = ["B", "KB", "MB", "GB", "TB"]
+    idx = int(math.floor(math.log(n, 1024)))
+    idx = min(idx, len(units) - 1)
+    value = n / (1024 ** idx)
+    # show one decimal for >=KB
+    if idx == 0:
+        return f"{int(value)}{units[idx]}"
+    else:
+        return f"{value:.1f}{units[idx]}"
+
+# ANSI color helpers
+class Colors:
+    HEADER = "\033[95m"
+    OKBLUE = "\033[94m"
+    OKCYAN = "\033[96m"
+    OKGREEN = "\033[92m"
+    WARNING = "\033[93m"
+    FAIL = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+
+def formats_to_table_html(info: dict) -> str:
+    formats = info.get("formats", [])
+    if not formats:
+        return '<span style="color: orange;">[yt-dlp] No formats available</span>'
+
+    header = (
+        f"<b>{'ID':<8}{'EXT':<6}{'RES':<10}{'FPS':<5}{'VCODEC':<15}{'ACODEC':<10}{'SIZE':<10}{'TBR':<6}</b>"
+    )
+    lines = [header, "-" * 80]
+
+    for f in formats:
+        fid = f.get("format_id", "")
+        ext = f.get("ext", "")
+        res = f.get("resolution", "") or f"{f.get('width', '')}x{f.get('height', '')}"
+        fps = str(f.get("fps", "")) if f.get("fps") else ""
+        vcodec = f.get("vcodec", "unknown")
+        acodec = f.get("acodec", "unknown")
+        size = f.get("filesize") or f.get("filesize_approx") or ""
+        if isinstance(size, int):
+            size = f"{size/1024/1024:.1f}MiB"
+        tbr = str(f.get("tbr", ""))
+
+        line = (
+            f"{fid:<8}"
+            f"<span style='color: teal;'>{ext:<6}</span>"
+            f"{res:<10}{fps:<5}"
+            f"<span style='color: green;'>{vcodec:<15}</span>"
+            f"<span style='color: green;'>{acodec:<10}</span>"
+            f"<span style='color: blue;'>{size:<10}</span>"
+            f"{tbr:<6}"
+        )
+        lines.append(line)
+
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
+
+
+def _run_ytdlp_python_api(url: str, ydl_opts: dict):
+    import yt_dlp as ytdl
+    safe_opts = dict(ydl_opts)
+    safe_opts.pop("logger", None)
+    with ytdl.YoutubeDL(safe_opts) as ydl:
+        return ydl.extract_info(url, download=False, process=True)
+
+
+
+
+
+
+def extract_info_blocking(url: str, ydl_opts: dict = None, exe_timeout: float = 15.0):
+    """
+    Extract info for `url` using either the configured standalone exe or the Python API.
+
+    If listformats=True in ydl_opts:
+      - prefer Python API (structured formats)
+      - log() the human-readable formats table in addition to returning JSON
+    """
+    if ydl_opts is None:
+        ydl_opts = get_ytdl_options()
+
+    wants_listformats = bool(ydl_opts.get("listformats", False))
+
+    # -----------------------
+    # Executable path
+    # -----------------------
+    if config.get_effective_ytdlp() and getattr(config, "use_ytdlp_exe", False):
+        exe_path = config.get_effective_ytdlp()
+        if not exe_path or not os.path.isfile(exe_path):
+            raise FileNotFoundError(f"yt-dlp executable not found: {exe_path}")
+
+        if wants_listformats:
+            # Force Python API instead so we can pretty-print formats
+            log("[yt-dlp.exe] Using Python API for listformats")
+            info = _run_ytdlp_python_api(url, ydl_opts)
+            log(formats_to_table_html(info))   # dump the table to your custom log
+            return info
+
+        # Normal JSON extraction via exe
+        cli_args = _ydl_opts_to_args(ydl_opts, allow_listformats=False)
+        forced = ["--dump-single-json", "--no-warnings", "--no-progress"]
+        cmd = [exe_path] + cli_args + forced + [url]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=exe_timeout)
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+
+        if stdout:
+            try:
+                return json.loads(stdout)
+            except json.JSONDecodeError:
+                pass
+
+        # salvage JSON if mixed output
+        combined = stdout + "\n" + stderr
+        first_lbrace = combined.find("{")
+        last_rbrace = combined.rfind("}")
+        if first_lbrace != -1 and last_rbrace > first_lbrace:
+            try:
+                return json.loads(combined[first_lbrace:last_rbrace + 1])
+            except json.JSONDecodeError:
+                pass
+
+        raise RuntimeError(
+            f"yt-dlp executable did not return valid JSON.\n"
+            f"Exit code: {proc.returncode}\n"
+            f"Command: {shlex.join(cmd)}\n"
+            f"Stdout:\n{stdout[:500]}\n\nStderr:\n{stderr[:500]}"
+        )
+
+    # -----------------------
+    # Python API fallback
+    # -----------------------
+    log("[yt-dlp] Using Python API")
+    info = _run_ytdlp_python_api(url, ydl_opts)
+
+    if wants_listformats:
+        log(formats_to_table_html(info))
+
+    return info
+
 
 
 class Video(DownloadItem):
@@ -456,36 +996,166 @@ class Stream:
         return self._mediatype
 
 
-def download_ffmpeg(destination=config.sett_folder):
-    """it should download ffmpeg.exe for windows os"""
 
-    # set download folder
+# Map your app-level destination folder default if needed
+DEFAULT_DEST = getattr(config, 'sett_folder', '.')
+
+def _gh_latest_asset(owner_repo: str, *, match_any, token: str | None = None):
+    """
+    Return (asset_name, asset_browser_download_url) for the first asset whose
+    name matches any of the provided predicates (in order).
+    """
+    api = f"https://api.github.com/repos/{owner_repo}/releases/latest"
+    headers = {'Accept': 'application/vnd.github+json'}
+    if token:
+        headers['Authorization'] = f"Bearer {token}"
+    r = requests.get(api, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    assets = data.get('assets') or []
+    # Try each predicate until one matches
+    for pred in match_any:
+        for a in assets:
+            name = a.get('name') or ''
+            if pred(name):
+                return name, a.get('browser_download_url')
+    raise RuntimeError(f"No matching assets found in {owner_repo} latest release")
+
+def _is_win():
+    return platform.system().lower().startswith('win')
+
+def _cpu():
+    # normalize to strings we use
+    m = platform.machine().lower()
+    # common normalizations
+    if m in ('amd64', 'x86_64', 'x64'):
+        return 'x86_64'
+    if m in ('arm64', 'aarch64'):
+        return 'arm64'
+    if m in ('x86', 'i386', 'i686'):
+        return 'x86'
+    return m
+
+def download_dependency(*, name: str, destination: str = DEFAULT_DEST):
+    """
+    Download latest Windows ZIP for yt-dlp FFmpeg builds or Deno from GitHub releases.
+    - name: 'ffmpeg' or 'deno'
+    - destination: where your DownloadItem should store the file
+    Sets the right filename and callback for your unzip logic.
+    """
+    # expose both folders for your unzip code (kept from your original)
     config.ffmpeg_download_folder = destination
+    config.deno_download_folder = destination
 
-    # first check windows 32 or 64
-    import platform
-    # ends with 86 for 32 bit and 64 for 64 bit i.e. Win7-64: AMD64 and Vista-32: x86
-    if platform.machine().endswith('64'):
-        # 64 bit link
-        url = 'https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-win-64.zip'
-    else:
-        # 32 bit link
-        url = 'https://www.videohelp.com/download/ffmpeg-4.3.1-win32-static.zip'
+    if not _is_win():
+        # You said Windows only; bail early with a helpful log
+        log(f"[download_dependency] Non-Windows OS detected; no Windows ZIP selected for {name}")
+        return
 
-    log('downloading: ', url)
+    token = getattr(config, 'github_token', None)  # optional, for rate limits
+    arch = _cpu()
 
-    # create a download object, will store ffmpeg in setting folder
-    # print('config.sett_folder = ', config.sett_folder)
-    d = DownloadItem(url=url, folder=config.ffmpeg_download_folder)
-    d.update(url)
-    d.name = 'ffmpeg.zip'  # must rename it for unzip to find it
-    # print('d.folder = ', d.folder)
+    if name.lower() == 'ffmpeg':
+        # yt-dlp’s FFmpeg builds: yt-dlp/FFmpeg-Builds (latest release)
+        # Choose gpl variant, prefer the “master/latest” flavor, fall back to any N-*-gpl.zip
+        def want_ffmpeg(asset_name: str) -> bool:
+            # Accept e.g.:
+            #   ffmpeg-master-latest-win64-gpl.zip
+            #   ffmpeg-N-121583-...-win64-gpl.zip
+            an = asset_name.lower()
+            if not an.endswith(".zip"):
+                return False
+            if "win" not in an or "gpl" not in an:
+                return False
+            if arch == 'x86_64' and "win64" in an:
+                return True
+            if arch == 'x86' and "win32" in an:
+                return True
+            if arch == 'arm64' and "winarm64" in an:
+                return True
+            return False
 
-    # post download
-    d.callback = 'unzip_ffmpeg'
+        # Two passes: prefer "master-latest" naming, then any gpl zip for our arch
+        pickers = [
+            lambda n: "master-latest" in n.lower() and want_ffmpeg(n),
+            lambda n: want_ffmpeg(n),
+        ]
+        asset_name, url = _gh_latest_asset("yt-dlp/FFmpeg-Builds", match_any=pickers, token=token)
 
-    # send download request to main window
-    config.main_window_q.put(('download', (d, False)))
+        # Build DownloadItem
+        log("downloading (ffmpeg): ", url)
+        d = DownloadItem(url=url, folder=config.ffmpeg_download_folder)
+        d.update(url)
+        d.name = 'ffmpeg.zip'          # your unzip_ffmpeg expects this
+        d.callback = 'unzip_ffmpeg'    # keep your existing callback
+        config.main_window_q.put(('download', (d, False)))
+        return
+
+    if name.lower() == 'deno':
+        # Official deno release: denoland/deno (latest)
+        # We want deno-x86_64-pc-windows-msvc.zip on Windows x64
+        # (No official 32-bit Windows archive; handle gracefully.)
+        def want_deno(asset_name: str) -> bool:
+            an = asset_name.lower()
+            if not an.endswith(".zip"):
+                return False
+            # canonical Windows 64-bit artifact:
+            return an == "deno-x86_64-pc-windows-msvc.zip"
+
+        if arch != 'x86_64':
+            raise RuntimeError("Deno ships Windows binaries for x86_64 only; unsupported CPU on Windows")
+
+        asset_name, url = _gh_latest_asset("denoland/deno", match_any=[want_deno], token=token)
+
+        log("downloading (deno): ", url)
+        d = DownloadItem(url=url, folder=config.deno_download_folder)
+        d.update(url)
+        d.name = 'deno.zip'            # so your unzip routine can branch
+        d.callback = unzip_deno
+        config.main_window_q.put(('download', (d, False)))
+        return
+
+    raise ValueError(f"Unsupported dependency name: {name!r}")
+
+
+def download_deno(destination):
+    download_dependency(name='deno', destination=destination)
+
+def download_ffmpeg(destination):
+    download_dependency(name='ffmpeg', destination=destination)
+
+
+
+# def download_ffmpeg(destination=config.sett_folder):
+#     """it should download ffmpeg.exe for windows os"""
+
+#     # set download folder
+#     config.ffmpeg_download_folder = destination
+
+#     # first check windows 32 or 64
+#     import platform
+#     # ends with 86 for 32 bit and 64 for 64 bit i.e. Win7-64: AMD64 and Vista-32: x86
+#     if platform.machine().endswith('64'):
+#         # 64 bit link
+#         url = 'https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-win-64.zip'
+#     else:
+#         # 32 bit link
+#         url = 'https://www.videohelp.com/download/ffmpeg-4.3.1-win32-static.zip'
+
+#     log('downloading: ', url)
+
+#     # create a download object, will store ffmpeg in setting folder
+#     # print('config.sett_folder = ', config.sett_folder)
+#     d = DownloadItem(url=url, folder=config.ffmpeg_download_folder)
+#     d.update(url)
+#     d.name = 'ffmpeg.zip'  # must rename it for unzip to find it
+#     # print('d.folder = ', d.folder)
+
+#     # post download
+#     d.callback = 'unzip_ffmpeg'
+
+#     # send download request to main window
+#     config.main_window_q.put(('download', (d, False)))
 
 
 def download_aria2c_with_wget(url, save_dir, filename):
@@ -517,61 +1187,173 @@ def download_aria2c(destination=config.sett_folder):
 
 
 
+def unzip_dependency(
+    *,
+    zip_basename: str,          # e.g. 'ffmpeg.zip' / 'deno.zip'
+    exe_name: str,              # 'ffmpeg.exe' / 'deno.exe'
+    folder_attr: str,           # 'ffmpeg_download_folder' / 'deno_download_folder'
+    popup_title: str,           # UI title
+    popup_msg: str,             # UI message
+    on_installed=None,          # callback(dest_exe_path) -> None
+):
+    log(f'unzip_dependency[{exe_name}]', 'unzipping')
+    try:
+        folder = getattr(config, folder_attr)
+        os.makedirs(folder, exist_ok=True)
+
+        file_name = os.path.join(folder, zip_basename)
+        log(f'unzip_dependency[{exe_name}]', f'zip file: {file_name}')
+
+        if not os.path.exists(file_name):
+            raise FileNotFoundError(f"ZIP not found: {file_name}")
+
+        with zipfile.ZipFile(file_name, 'r') as zip_ref:
+            members = zip_ref.namelist()
+            log(f'unzip_dependency[{exe_name}]', f'zip contains: {members}')
+
+            # Find the exe inside the zip (allow nested paths)
+            exe_member = None
+            exe_lower = exe_name.lower()
+            for m in members:
+                if m.lower().endswith(exe_lower):
+                    exe_member = m
+                    break
+
+            if not exe_member:
+                log(f'unzip_dependency[{exe_name}]', f'{exe_name} not found in archive')
+                # still show a popup so the user knows something went wrong
+                param = dict(
+                    title=f"{popup_title} (Error)",
+                    msg=f"Archive did not contain {exe_name}.",
+                    type_='error',
+                )
+                config.main_window_q.put(('popup', param))
+                return
+
+            dest = os.path.join(folder, exe_name)
+
+            # Remove any existing exe
+            try:
+                if os.path.exists(dest):
+                    os.remove(dest)
+            except Exception as e:
+                log(f'unzip_dependency[{exe_name}]', f'could not remove existing exe: {e}')
+
+            # Extract just that exe to dest
+            log(f'unzip_dependency[{exe_name}]', f'extracting member {exe_member} to {dest}')
+            with zip_ref.open(exe_member) as src, open(dest, 'wb') as out:
+                shutil.copyfileobj(src, out)
+
+        # Remove the zip after successful extraction
+        try:
+            delete_file(file_name)
+        except Exception as e:
+            log(f'unzip_dependency[{exe_name}]', f'could not delete zip: {e}')
+
+        # Post-install hook
+        if callable(on_installed):
+            try:
+                on_installed(dest)
+            except Exception as e:
+                log(f'unzip_dependency[{exe_name}] on_installed error', e)
+
+        # UI popup
+        param = dict(title=popup_title, msg=popup_msg, type_='info')
+        config.main_window_q.put(('popup', param))
+        log(f'unzip_dependency[{exe_name}]', f'{exe_name} is ready at: {folder}')
+
+    except Exception as e:
+        log(f'unzip_dependency[{exe_name}] error', e)
+
 
 def unzip_ffmpeg():
-    log('unzip_ffmpeg:', 'unzipping')
-    try:
-        folder = config.ffmpeg_download_folder
-        file_name = os.path.join(folder, 'ffmpeg.zip')
+    def _on_ffmpeg(dest):
+        # update wherever you keep your canonical ffmpeg path
+        config.ffmpeg_actual_path = dest
+    return unzip_dependency(
+        zip_basename='ffmpeg.zip',
+        exe_name='ffmpeg.exe',
+        folder_attr='ffmpeg_download_folder',
+        popup_title='FFmpeg Info',
+        popup_msg='FFmpeg is now available. Please try downloading the video again.',
+        on_installed=_on_ffmpeg,
+    )
 
-        # List folders before extraction
-        before = set(os.listdir(folder))
 
-        # Extract zip file
-        with zipfile.ZipFile(file_name, 'r') as zip_ref:
-            zip_ref.extractall(folder)
+def unzip_deno():
+    def _on_deno(dest):
+        # remember deno path so yt-dlp can use it
+        config.deno_actual_path = dest
+        config.deno_verified = True
+        # if you build yt-dlp options from config, this makes it automatic:
+        # e.g., in get_ytdl_options():
+        #   if getattr(config, 'deno_executable', None):
+        #       ydl_opts['js_runtimes'] = {'deno': {'executable': config.deno_executable}}
+    return unzip_dependency(
+        zip_basename='deno.zip',
+        exe_name='deno.exe',
+        folder_attr='deno_download_folder',
+        popup_title='Deno Info',
+        popup_msg='Deno is now available. YouTube extraction should work on the next attempt.',
+        on_installed=_on_deno,
+    )
 
-        # List folders after extraction
-        after = set(os.listdir(folder))
-        new_items = after - before
 
-        # Find the new folder (could be more than one, but usually just one)
-        extracted_folder = None
-        for item in new_items:
-            path = os.path.join(folder, item)
-            if os.path.isdir(path):
-                extracted_folder = path
-                break
 
-        log('ffmpeg update:', f'Extracted folder: {extracted_folder}')
+# def unzip_ffmpeg():
+#     log('unzip_ffmpeg:', 'unzipping')
+#     try:
+#         folder = config.ffmpeg_download_folder
+#         file_name = os.path.join(folder, 'ffmpeg.zip')
 
-        # Optionally, move/copy ffmpeg.exe from extracted_folder to folder, or update config
-        # Example: find ffmpeg.exe inside extracted_folder
-        ffmpeg_exe = None
-        for root, dirs, files in os.walk(extracted_folder):
-            for file in files:
-                if file.lower() == "ffmpeg":
-                    ffmpeg_exe = os.path.join(root, file)
-                    break
-            if ffmpeg_exe:
-                break
+#         # List folders before extraction
+#         before = set(os.listdir(folder))
 
-        if ffmpeg_exe:
-            dest = os.path.join(folder, "ffmpeg")
-            shutil.move(ffmpeg_exe, dest)
-            log('ffmpeg update:', f'ffmpeg moved to {dest}')
-        else:
-            log('ffmpeg update:', 'ffmpeg not found in extracted folder')
+#         # Extract zip file
+#         with zipfile.ZipFile(file_name, 'r') as zip_ref:
+#             zip_ref.extractall(folder)
 
-        # Clean up zip file
-        delete_file(file_name)
-        delete_folder(extracted_folder, verbose=True)
+#         # List folders after extraction
+#         after = set(os.listdir(folder))
+#         new_items = after - before
+
+#         # Find the new folder (could be more than one, but usually just one)
+#         extracted_folder = None
+#         for item in new_items:
+#             path = os.path.join(folder, item)
+#             if os.path.isdir(path):
+#                 extracted_folder = path
+#                 break
+
+#         log('ffmpeg update:', f'Extracted folder: {extracted_folder}')
+
+#         # Optionally, move/copy ffmpeg.exe from extracted_folder to folder, or update config
+#         # Example: find ffmpeg.exe inside extracted_folder
+#         ffmpeg_exe = None
+#         for root, dirs, files in os.walk(extracted_folder):
+#             for file in files:
+#                 if file.lower() == "ffmpeg":
+#                     ffmpeg_exe = os.path.join(root, file)
+#                     break
+#             if ffmpeg_exe:
+#                 break
+
+#         if ffmpeg_exe:
+#             dest = os.path.join(folder, "ffmpeg")
+#             shutil.move(ffmpeg_exe, dest)
+#             log('ffmpeg update:', f'ffmpeg moved to {dest}')
+#         else:
+#             log('ffmpeg update:', 'ffmpeg not found in extracted folder')
+
+#         # Clean up zip file
+#         delete_file(file_name)
+#         delete_folder(extracted_folder, verbose=True)
         
-        param = dict(title='Ffmpeg Info', msg='Ffmpeg is now available. Please try download again.', type_='info')
-        config.main_window_q.put(('popup', param))
-        log('ffmpeg update:', 'ffmpeg .. is ready at: ', folder)
-    except Exception as e:
-        log('unzip_ffmpeg: error ', e)
+#         param = dict(title='Ffmpeg Info', msg='Ffmpeg is now available. Please try download again.', type_='info')
+#         config.main_window_q.put(('popup', param))
+#         log('ffmpeg update:', 'ffmpeg .. is ready at: ', folder)
+#     except Exception as e:
+#         log('unzip_ffmpeg: error ', e)
 
 
 
@@ -616,6 +1398,49 @@ def unzip_aria2c():
 
     except Exception as e:
         log('unzip_aria2c: error', e)
+
+
+def check_deno():
+    """Check for deno availability, and cache result to avoid re-checking."""
+
+    # ✅ If previously verified, skip check
+    if config.deno_verified:
+        return True
+
+    log('Checking Deno availability...')
+    found = False
+
+    try:
+        for folder in [config.current_directory, config.global_sett_folder]:
+            if not folder: continue  # skip if not set
+            for file in os.listdir(folder):
+                if file.lower().startswith("deno"):
+                    full_path = os.path.join(folder, file)
+                    if os.path.isfile(full_path):
+                        found = True
+                        config.deno_actual_path = full_path
+                        break
+            if found:
+                break
+    except Exception as e:
+        log(f"Error while checking folders for deno: {e}")
+
+    # Try system PATH
+    if not found:
+        from shutil import which
+        path = which("deno")
+        if path:
+            config.deno_actual_path = os.path.realpath(path)
+            found = True
+
+    if found:
+        config.deno_verified = True  # ✅ Cache success
+        log('Deno found:', config.deno_actual_path)
+        return True
+    else:
+        config.deno_actual_path = None
+        log('Deno not found. Will prompt user.')
+        return False
 
 
 
@@ -721,7 +1546,7 @@ def merge_video_audio(video, audio, output, d):
     log('merging video and audio')
 
     # ffmpeg file full location
-    ffmpeg = config.get_ffmpeg_path()
+    ffmpeg = config.ffmpeg_actual_path
 
     # very fast audio just copied, format must match [mp4, m4a] and [webm, webm]
     cmd1 = f'"{ffmpeg}" -y -i "{video}" -i "{audio}" -c copy "{output}"'
@@ -1013,7 +1838,7 @@ def post_process_hls(d):
     # cmd = f'"{config.ffmpeg_actual_path}" -y -protocol_whitelist "file,http,https,tcp,tls,crypto"  ' \
     #       f'-allowed_extensions ALL -i "{local_video_m3u8_file}" -c copy -f mp4 "file:{d.temp_file}"'
     
-    cmd = f'"{config.get_ffmpeg_path}" -y -protocol_whitelist "file,http,https,tcp,tls,crypto"  ' \
+    cmd = f'"{config.ffmpeg_actual_path}" -y -protocol_whitelist "file,http,https,tcp,tls,crypto"  ' \
           f'-allowed_extensions ALL -i "{local_video_m3u8_file}" -c copy -f mp4 "file:{d.temp_file}"'
 
     error, output = run_command(cmd, d=d)
@@ -1025,7 +1850,7 @@ def post_process_hls(d):
         # cmd = f'"{config.ffmpeg_actual_path}" -y -protocol_whitelist "file,http,https,tcp,tls,crypto"  ' \
         #       f'-allowed_extensions ALL -i "{local_audio_m3u8_file}" -c copy -f mp4 "file:{d.audio_file}"'
 
-        cmd = f'"{config.get_ffmpeg_path}" -y -protocol_whitelist "file,http,https,tcp,tls,crypto"  ' \
+        cmd = f'"{config.ffmpeg_actual_path}" -y -protocol_whitelist "file,http,https,tcp,tls,crypto"  ' \
               f'-allowed_extensions ALL -i "{local_audio_m3u8_file}" -c copy -f mp4 "file:{d.audio_file}"'
 
         error, output = run_command(cmd, d=d)

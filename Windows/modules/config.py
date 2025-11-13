@@ -133,6 +133,7 @@ download_folder = DEFAULT_DOWNLOAD_FOLDER
 # user-selected overrides (UI should set these when user browses)
 user_selected_ffmpeg: Optional[str] = None
 user_selected_ytdlp: Optional[str] = None
+user_selected_deno: Optional[str] = None
 
 # helper to pick a tool path
 
@@ -224,6 +225,21 @@ yt_dlp_actual_path = _find_tool(
 )
 
 
+# ------------- deno resolution -------------------
+_deno_extra_paths = [
+    os.path.join(sett_folder, 'deno.exe')
+]
+deno_exe = ""
+deno_verified = False
+deno_download_folder = sett_folder
+deno_actual_path = _find_tool(
+    "deno",
+    selected=(deno_exe or user_selected_deno),
+    bundled_name="deno.exe",
+    extra_paths=_deno_extra_paths
+)
+
+
 # ---------- helper setters so UI can update selections at runtime ----------
 def set_user_ffmpeg(path: Optional[str]):
     """Call this when user picks a custom ffmpeg path from the UI."""
@@ -243,6 +259,16 @@ def set_user_ytdlp(path: Optional[str]):
     return yt_dlp_actual_path
 
 
+def set_user_deno(path: Optional[str]):
+    """Call this when user picks a custom yt-dlp executable from the UI."""
+    global user_selected_deno, deno_exe, deno_actual_path
+    user_selected_deno = str(path) if path else None
+    # keep the legacy variable in sync as some code may refer to deno_exe
+    deno_exe = user_selected_deno or ""
+    deno_actual_path = _find_tool("deno", selected=user_selected_deno or deno_exe, bundled_name="deno.exe", extra_paths=_deno_extra_paths)
+    return deno_actual_path
+
+
 # ---------- convenience getters for other modules ----------
 def get_effective_ffmpeg() -> Optional[str]:
     """Return the best ffmpeg path found (user -> bundled -> system)"""
@@ -251,6 +277,10 @@ def get_effective_ffmpeg() -> Optional[str]:
 def get_effective_ytdlp() -> Optional[str]:
     """Return best yt-dlp path found (user -> bundled -> system)"""
     return yt_dlp_actual_path
+
+def get_effective_deno() -> Optional[str]:
+    """Return best deno path found (user -> bundled -> system)"""
+    return deno_actual_path
 
 
 
@@ -302,7 +332,7 @@ settings_keys = ['current_theme','machine_id', 'tutorial_completed', 'download_e
                  'segment_size', 'show_thumbnail', 'on_startup', 'show_all_logs', 'hide_app', 'enable_speed_limit', 'speed_limit', 'max_concurrent_downloads', 'max_connections',
                  'update_frequency', 'last_update_check','APP_LATEST_VERSION', 'confirm_update', 'proxy', 'proxy_type', 'raw_proxy', 'proxy_user', 'proxy_pass', 'enable_proxy',
                  'log_level', 'download_folder', 'retry_scheduled_enabled', 'retry_scheduled_max_tries', 'retry_scheduled_interval_mins', 'aria2c_config',
-                 'aria2_verified', 'ytdlp_config', 'preferred_audio_langs', 'enable_ytdlp_exe', 'use_ytdlp_exe', 'yt_dlp_exe']
+                 'aria2_verified', 'ytdlp_config', 'preferred_audio_langs', 'enable_ytdlp_exe', 'use_ytdlp_exe', 'yt_dlp_exe', 'deno_verified', 'deno_exe']
 
 # -------------------------------------------------------------------------------------
 

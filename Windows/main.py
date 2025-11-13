@@ -36,6 +36,7 @@ from typing import Any
 from pathlib import Path
 from collections import deque
 from threading import Thread, Timer
+from typing import Callable, Optional
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote, parse_qs, urlencode, urlunparse
 
@@ -69,7 +70,7 @@ from modules.downloaditem import DownloadItem
 from modules.aria2c_manager import aria2c_manager
 from modules.settings_manager import SettingsManager
 from modules import config, brain, setting, video, updater, setting
-from modules.video import (Video, check_ffmpeg, download_ffmpeg, download_aria2c)
+from modules.video import (Video, check_ffmpeg, check_deno, download_deno, download_ffmpeg)
 from modules.utils import (size_format, validate_file_name, compare_versions, compare_versions_2, log, time_format,
     notify, run_command, handle_exceptions, get_machine_id)
 from modules.helper import (toolbar_buttons_state, get_msgbox_style, change_cursor, show_information,
@@ -1393,6 +1394,12 @@ class DownloadManagerUI(QMainWindow):
         new_query = urlencode(clean_query, doseq=True)
         cleaned_url = urlunparse(parsed._replace(query=new_query))
         return cleaned_url
+    
+    def is_youtube_url(self, url: str) -> bool:
+        netloc = urlparse(url).netloc.lower()
+        return any(netloc.endswith(d) for d in (
+            'youtube.com', 'youtu.be', 'music.youtube.com'
+        ))
 
     def url_text_change(self):
         """Handle URL changes in the QLineEdit."""
@@ -1402,6 +1409,22 @@ class DownloadManagerUI(QMainWindow):
 
         if url == self.d.url:
             return
+
+        if self.is_youtube_url(url):
+            ok = self.ensure_dependency(
+                name="Deno",
+                check_func=check_deno,           # existing check
+                download_func=download_deno,     # downloader/installer
+                recommended_dir=config.global_sett_folder,
+                local_dir=config.current_directory,
+                non_windows_msg=self.tr(
+                    '"Deno" is required to solve JavaScript challenges for YouTube.\n'
+                    "Install from the official docs or add the deno executable to PATH."
+                ),
+            )
+            if not ok:
+                # Abort gracefully; user cancelled or install failed
+                return
         
 
         self.reset()
@@ -1672,7 +1695,23 @@ class DownloadManagerUI(QMainWindow):
                 self.d.ext = self.extract_ext_from_url(self.d.url, self.d)
                 
             # log('Dash video detected')
-            if not self.ffmpeg_check():
+            # if not self.ffmpeg_check():
+            #     log('Download cancelled, FFMPEG is missing', log_level=2)
+            #     return 'cancelled'
+
+            ok = self.ensure_dependency(name="FFmpeg", 
+                check_func=check_ffmpeg, 
+                download_func=download_ffmpeg, 
+                recommended_dir=config.global_sett_folder, 
+                local_dir=config.current_directory,
+                non_windows_msg=self.tr(
+                    '"ffmpeg" is required to merge an audio stream with your video.\n'
+                    f'Executable must be found at {config.ffmpeg_actual_path_2} or added to PATH.\n'
+                    "On Linux: sudo apt-get update && sudo apt-get install ffmpeg\n"
+                    "On macOS: brew install ffmpeg"
+                ),
+            )
+            if not ok:
                 log('Download cancelled, FFMPEG is missing', log_level=2)
                 return 'cancelled'
 
@@ -2374,135 +2413,270 @@ class DownloadManagerUI(QMainWindow):
 
     # region Add-ons Check
 
-    def ffmpeg_check(self):
-        """Check if ffmpeg is available, if not, prompt user to download."""
+    def ensure_dependency(
+        self,
+        *,
+        name: str,                                 # e.g. "FFmpeg" or "Deno"
+        check_func: Callable[[], bool],            # e.g. check_ffmpeg, check_deno
+        download_func: Callable[[str], None],      # e.g. download_ffmpeg(dest), download_deno(dest)
+        recommended_dir: Optional[str] = None,     # e.g. config.global_sett_folder
+        local_dir: Optional[str] = None,           # e.g. config.current_directory
+        missing_title: Optional[str] = None,       # dialog title on Windows
+        missing_label: Optional[str] = None,       # main label on Windows
+        non_windows_msg: Optional[str] = None,     # messagebox text on non-Windows
+    ) -> bool:
+        """
+        Ensure `name` is available. If not, on Windows show a themed download dialog;
+        on other OSes show a guidance MessageBox. Returns True if available/installed, else False.
+        """
+
+        # Already present?
+        try:
+            if check_func():
+                return True
+        except Exception:
+            # If your check function can raise, treat as missing
+            pass
+
+        # Defaults for text
+        title = missing_title or self.tr(f'{name} is missing')
+        label_text = missing_label or self.tr(f'"{name}" is missing and needs to be downloaded:')
+        nonwin_text = non_windows_msg or self.tr(
+            f'"{name}" is required for this action.\n'
+            f'Please install {name} with your OS package manager or provide its path in the app settings.'
+        )
+
+        # Windows: show the styled download dialog just like your ffmpeg flow
+        if getattr(config, 'operating_system', '').lower() == 'windows':
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            dialog.setStyleSheet("""
+                QDialog {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #0F1B14,
+                        stop: 1 #050708
+                    );
+                    color: white;
+                    border-radius: 14px;
+                }
+                QLabel { color: white; font-size: 12px; }
+                QRadioButton { padding: 4px; }
+            """)
+
+            layout = QVBoxLayout(dialog)
+
+            label = QLabel(label_text)
+            layout.addWidget(label)
+
+            # Destination choices (fall back to current dir if recommended/local not provided)
+            rec_dir = recommended_dir or getattr(config, 'global_sett_folder', getattr(config, 'current_directory', '.'))
+            loc_dir = local_dir or getattr(config, 'current_directory', '.')
+
+            recommended = self.tr("Recommended:")
+            local_fd = self.tr("Local folder:")
+            recommended_radio = QRadioButton(f"{recommended} {rec_dir}")
+            recommended_radio.setChecked(True)
+            local_radio = QRadioButton(f"{local_fd} {loc_dir}")
+
+            radio_group = QButtonGroup(dialog)
+            radio_group.addButton(recommended_radio)
+            radio_group.addButton(local_radio)
+
+            radio_layout = QVBoxLayout()
+            radio_layout.addWidget(recommended_radio)
+            radio_layout.addWidget(local_radio)
+            layout.addLayout(radio_layout)
+
+            # Buttons
+            button_layout = QHBoxLayout()
+            download_button = QPushButton(self.tr('Download'))
+            download_button.setStyleSheet("""
+                QPushButton {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #0F1B14,
+                        stop: 1 #050708
+                    );
+                    color: white; border: none; border-radius: 6px;
+                    padding: 6px 16px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #33d47c; }
+            """)
+            cancel_button = QPushButton(self.tr('Cancel'))
+            cancel_button.setStyleSheet("""
+                QPushButton {
+                    background-color: qlineargradient(
+                        x1: 0, y1: 0, x2: 1, y2: 1,
+                        stop: 0 #0F1B14,
+                        stop: 1 #050708
+                    );
+                    color: white; border: none; border-radius: 6px;
+                    padding: 6px 16px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #3c3c3c; }
+            """)
+            button_layout.addWidget(download_button)
+            button_layout.addWidget(cancel_button)
+            layout.addLayout(button_layout)
+            dialog.setLayout(layout)
+
+            def on_download():
+                dest = rec_dir if recommended_radio.isChecked() else loc_dir
+                try:
+                    download_func(dest)
+                finally:
+                    dialog.accept()
+
+            def on_cancel():
+                dialog.reject()
+
+            download_button.clicked.connect(on_download)
+            cancel_button.clicked.connect(on_cancel)
+
+            ok = dialog.exec()
+            if not ok:
+                return False
+
+            # Re-check after attempted install
+            try:
+                return bool(check_func())
+            except Exception:
+                return False
+
+        # Non-Windows: show guidance
+        QMessageBox.critical(self, title, nonwin_text)
+        return False
+
+    # def ffmpeg_check(self):
+    #     """Check if ffmpeg is available, if not, prompt user to download."""
         
-        if not check_ffmpeg():
-            if config.operating_system == 'Windows':
-                # Create the dialog
-                dialog = QDialog(self)
-                dialog.setWindowTitle(self.tr('FFmpeg is missing'))
-                dialog.setStyleSheet("""
-                    QDialog {
-                        background-color: qlineargradient(
-                            x1: 0, y1: 0, x2: 1, y2: 1,
-                            stop: 0 #0F1B14,
-                            stop: 1 #050708
-                        );
-                        color: white;
-                        border-radius: 14px;
-                    }
-                    QLabel {
-                        color: white;
-                        font-size: 12px;
-                    }
-                    QRadioButton {
-                        padding: 4px;
-                    }
+    #     if not check_ffmpeg():
+    #         if config.operating_system == 'Windows':
+    #             # Create the dialog
+    #             dialog = QDialog(self)
+    #             dialog.setWindowTitle(self.tr('FFmpeg is missing'))
+    #             dialog.setStyleSheet("""
+    #                 QDialog {
+    #                     background-color: qlineargradient(
+    #                         x1: 0, y1: 0, x2: 1, y2: 1,
+    #                         stop: 0 #0F1B14,
+    #                         stop: 1 #050708
+    #                     );
+    #                     color: white;
+    #                     border-radius: 14px;
+    #                 }
+    #                 QLabel {
+    #                     color: white;
+    #                     font-size: 12px;
+    #                 }
+    #                 QRadioButton {
+    #                     padding: 4px;
+    #                 }
                     
-                """)
+    #             """)
 
-                # Layout setup
-                layout = QVBoxLayout(dialog)
+    #             # Layout setup
+    #             layout = QVBoxLayout(dialog)
 
-                # Label for missing FFmpeg
-                label = QLabel(self.tr('"ffmpeg" is missing!! and needs to be downloaded:'))
-                layout.addWidget(label)
+    #             # Label for missing FFmpeg
+    #             label = QLabel(self.tr('"ffmpeg" is missing!! and needs to be downloaded:'))
+    #             layout.addWidget(label)
 
-                # Radio buttons for choosing destination folder
-                recommended, local_fd = self.tr("Recommended:"), self.tr("Local folder:")
-                recommended_radio = QRadioButton(f"{recommended} {config.global_sett_folder}")
-                recommended_radio.setChecked(True)
-                local_radio = QRadioButton(f"{local_fd} {config.current_directory}")
+    #             # Radio buttons for choosing destination folder
+    #             recommended, local_fd = self.tr("Recommended:"), self.tr("Local folder:")
+    #             recommended_radio = QRadioButton(f"{recommended} {config.global_sett_folder}")
+    #             recommended_radio.setChecked(True)
+    #             local_radio = QRadioButton(f"{local_fd} {config.current_directory}")
 
-                # Group radio buttons
-                radio_group = QButtonGroup(dialog)
-                radio_group.addButton(recommended_radio)
-                radio_group.addButton(local_radio)
+    #             # Group radio buttons
+    #             radio_group = QButtonGroup(dialog)
+    #             radio_group.addButton(recommended_radio)
+    #             radio_group.addButton(local_radio)
 
-                # Layout for radio buttons
-                radio_layout = QVBoxLayout()
-                radio_layout.addWidget(recommended_radio)
-                radio_layout.addWidget(local_radio)
+    #             # Layout for radio buttons
+    #             radio_layout = QVBoxLayout()
+    #             radio_layout.addWidget(recommended_radio)
+    #             radio_layout.addWidget(local_radio)
 
-                layout.addLayout(radio_layout)
+    #             layout.addLayout(radio_layout)
 
-                # Buttons for Download and Cancel
-                button_layout = QHBoxLayout()
-                download_button = QPushButton(self.tr('Download'))
-                download_button.setStyleSheet("""
-                    QPushButton {
-                        background-color: qlineargradient(
-                        x1: 0, y1: 0, x2: 1, y2: 1,
-                        stop: 0 #0F1B14,
-                        stop: 1 #050708
-                        ); 
-                        color: white;
-                        border: none;
-                        border-radius: 6px;
-                        padding: 6px 16px;
-                        font-weight: bold;
-                    }
-                    QPushButton:hover {
-                        background-color: #33d47c;
-                    }
-                """)
-                cancel_button = QPushButton(self.tr('Cancel'))
-                cancel_button.setStyleSheet("""
-                    QPushButton {
-                        background-color: qlineargradient(
-                        x1: 0, y1: 0, x2: 1, y2: 1,
-                        stop: 0 #0F1B14,
-                        stop: 1 #050708
-                        ); 
-                        color: white;
-                        border: none;
-                        border-radius: 6px;
-                        padding: 6px 16px;
-                        font-weight: bold;
-                    }
-                    QPushButton:hover {
-                        background-color: #3c3c3c;
-                    }
-                """)
-                button_layout.addWidget(download_button)
-                button_layout.addWidget(cancel_button)
+    #             # Buttons for Download and Cancel
+    #             button_layout = QHBoxLayout()
+    #             download_button = QPushButton(self.tr('Download'))
+    #             download_button.setStyleSheet("""
+    #                 QPushButton {
+    #                     background-color: qlineargradient(
+    #                     x1: 0, y1: 0, x2: 1, y2: 1,
+    #                     stop: 0 #0F1B14,
+    #                     stop: 1 #050708
+    #                     ); 
+    #                     color: white;
+    #                     border: none;
+    #                     border-radius: 6px;
+    #                     padding: 6px 16px;
+    #                     font-weight: bold;
+    #                 }
+    #                 QPushButton:hover {
+    #                     background-color: #33d47c;
+    #                 }
+    #             """)
+    #             cancel_button = QPushButton(self.tr('Cancel'))
+    #             cancel_button.setStyleSheet("""
+    #                 QPushButton {
+    #                     background-color: qlineargradient(
+    #                     x1: 0, y1: 0, x2: 1, y2: 1,
+    #                     stop: 0 #0F1B14,
+    #                     stop: 1 #050708
+    #                     ); 
+    #                     color: white;
+    #                     border: none;
+    #                     border-radius: 6px;
+    #                     padding: 6px 16px;
+    #                     font-weight: bold;
+    #                 }
+    #                 QPushButton:hover {
+    #                     background-color: #3c3c3c;
+    #                 }
+    #             """)
+    #             button_layout.addWidget(download_button)
+    #             button_layout.addWidget(cancel_button)
 
-                layout.addLayout(button_layout)
+    #             layout.addLayout(button_layout)
 
-                # Set layout and show the dialog
-                dialog.setLayout(layout)
+    #             # Set layout and show the dialog
+    #             dialog.setLayout(layout)
 
-                # Handle button actions
-                def on_download():
-                    selected_folder = config.global_sett_folder if recommended_radio.isChecked() else config.current_directory
-                    download_ffmpeg(destination=selected_folder)
-                    dialog.accept()  # Close the dialog after download
+    #             # Handle button actions
+    #             def on_download():
+    #                 selected_folder = config.global_sett_folder if recommended_radio.isChecked() else config.current_directory
+    #                 download_ffmpeg(destination=selected_folder)
+    #                 dialog.accept()  # Close the dialog after download
 
-                def on_cancel():
-                    dialog.reject()  # Close dialog on cancel
+    #             def on_cancel():
+    #                 dialog.reject()  # Close dialog on cancel
 
-                # Connect button signals
-                download_button.clicked.connect(on_download)
-                cancel_button.clicked.connect(on_cancel)
+    #             # Connect button signals
+    #             download_button.clicked.connect(on_download)
+    #             cancel_button.clicked.connect(on_cancel)
 
-                # Execute the dialog
-                dialog.exec()
+    #             # Execute the dialog
+    #             dialog.exec()
 
-            else:
-                # Show error popup for non-Windows systems
-                s2 = self.tr('"ffmpeg" is required to merge an audio stream with your video.')
-                s3, s3a = self.tr('Executable must be found at'), self.tr("folder or add the ffmpeg path to system PATH.")
-                s4 = self.tr("Please do 'sudo apt-get update' and 'sudo apt-get install ffmpeg' on Linux or 'brew install ffmpeg' on MacOS.")
-                QMessageBox.critical(self, 
-                                    self.tr('FFmpeg is missing'),
-                                    f'{s2} \n'
-                                    f'{s3} {config.ffmpeg_actual_path_2} {s3a} \n'
-                                    f"{s4}")
+    #         else:
+    #             # Show error popup for non-Windows systems
+    #             s2 = self.tr('"ffmpeg" is required to merge an audio stream with your video.')
+    #             s3, s3a = self.tr('Executable must be found at'), self.tr("folder or add the ffmpeg path to system PATH.")
+    #             s4 = self.tr("Please do 'sudo apt-get update' and 'sudo apt-get install ffmpeg' on Linux or 'brew install ffmpeg' on MacOS.")
+    #             QMessageBox.critical(self, 
+    #                                 self.tr('FFmpeg is missing'),
+    #                                 f'{s2} \n'
+    #                                 f'{s3} {config.ffmpeg_actual_path_2} {s3a} \n'
+    #                                 f"{s4}")
 
-            return False
-        else:
-            return True
+    #         return False
+    #     else:
+    #         return True
         
 
     

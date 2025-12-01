@@ -316,21 +316,27 @@ class WhatsNew(QDialog):
 
         if changelog is None:
             changelog = [
-                {'version': f'{__version__}',
-                'date': '2025-11-13' ,
-                'highlights': [
-                    '🛠️ Bug Fixes & Improvements',
-                    '🚀 Performance Enhancements',
-                    '🌐 UI/UX Tweaks',
-                    '🆕 Deno Added and Enabled by Default'
-                ],
-                'details': 'We are excited to announce the release of OmniPull version 2.0.7! This update focuses on enhancing stability, performance, and user experience. \n\n'
-                            '🛠️ **Bug Fixes & Improvements:** We have addressed several bugs reported by our users, ensuring a smoother and more reliable experience. \n\n'
-                            '🚀 **Performance Enhancements:** Significant optimizations have been made to improve download speeds and overall application responsiveness. \n\n'
-                            '🌐 **UI/UX Tweaks:** We have refined the user interface to make it more intuitive and visually appealing, enhancing your interaction with the app. \n\n'
-                            '🆕 **Deno Added and Enabled by Default:** Deno, a secure runtime for JavaScript and TypeScript, has been integrated into OmniPull and is now enabled by default. This addition enhances the app\'s capabilities and performance when handling JavaScript-based content as required by YT-DLP. \n User\'s might have to download and install it system wide or use the settings to point to path. \n\n',
-                'url': 'https://github.com/Annor-Gyimah/OmniPull/releases/tag/v.2.0.7'
                 
+                {'version': f'{__version__}',
+                    'date': '2025-11-27',
+                    'highlights': [
+                        '🔧 Updated bundled yt-dlp to nightly (2025.11.24.232953.dev0)',
+                        '🛡️ Fixed startup crash caused by invalid merge_output_format',
+                        '✅ Safer config validation with sensible fallbacks (merge_output_format -> mp4)',
+                        '🔁 Improved yt-dlp updater logic (safe replace / schedule update when exe is in-use)',
+                        '⚙️ Minor stability and startup performance improvements'
+                    ],
+                    'details': (
+                        "This release updates the bundled yt-dlp to the latest nightly (2025.11.24.232953.dev0) "
+                        "and fixes a startup crash caused by an invalid or missing `merge_output_format` setting. "
+                        "The crash occurred when the app attempted to use the config value directly without validation, "
+                        "causing an unhandled exception during startup. The app now validates `merge_output_format`, "
+                        "coerces invalid values to a safe default (mp4), and logs a non-blocking warning instead of raising. "
+                        "The yt-dlp updater has also been hardened: new binaries are downloaded to a temporary file, "
+                        "a safe replacement is attempted, and updates are scheduled (via `.exe.new`) if the file is in use. "
+                        "Additional logging and input validation reduce startup latency and improve overall stability."
+                    ),
+                    'url': 'https://github.com/Annor-Gyimah/OmniPull/releases/tag/v.2.0.8'
                 },
                 {'version': f'2.0.3', 
                 'date': '2025-10-25', 
@@ -403,9 +409,3 @@ class WhatsNew(QDialog):
             self.move(center - self.rect().center())
         return self.exec()
 
-
-# if __name__ == '__main__':
-#     import sys
-#     app = QApplication(sys.argv)
-#     dlg = WhatsNew()
-#     dlg.exec()

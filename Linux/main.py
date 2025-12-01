@@ -1740,7 +1740,7 @@ class DownloadManagerUI(QMainWindow):
                 local_dir=config.current_directory,
                 non_windows_msg=self.tr(
                     '"ffmpeg" is required to merge an audio stream with your video.\n'
-                    f'Executable must be found at {config.ffmpeg_actual_path_2} or added to PATH.\n'
+                    f'Executable must be found at {config.ffmpeg_folder_path} or added to PATH.\n'
                     "On Linux: sudo apt-get update && sudo apt-get install ffmpeg\n"
                     "On macOS: brew install ffmpeg"
                 ),

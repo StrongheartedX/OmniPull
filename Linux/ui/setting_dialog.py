@@ -423,7 +423,7 @@ class SettingsWindow(QDialog):
         format_layout = QHBoxLayout()
         format_label = QLabel(self.tr("Download Format:"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["(bv*+ba/b)est", "(bv*+ba/b)est", 'mp4', 'mp3', 'mkv', 'webm', 'flv', 'avi'])
+        self.format_combo.addItems(['mp4', 'mp3', 'mkv', 'webm', 'flv', 'avi'])
         self.format_combo.setToolTip(self.tr("Select which format yt-dlp should download."))
         format_layout.addWidget(format_label)
         format_layout.addWidget(self.format_combo)

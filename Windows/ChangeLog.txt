@@ -1,3 +1,24 @@
+2.0.8
+- Updated bundled yt-dlp to nightly: 2025.11.24.232953.dev0
+- Fixed startup crash caused by invalid/empty merge_output_format (now validated, defaults to mp4)
+- Hardened yt-dlp updater:
+    - Downloads to a temp file and safely replaces the exe
+    - Updater now returns clear status and messages to the UI
+- Settings UI improvements and validation:
+    - Debounced and threaded probing of executables to avoid blocking UI on open
+    - Inline warnings instead of repeated modal popups
+    - Correct handling of 'use custom yt-dlp' checkbox (falls back to bundled if unset)
+- Installer / bundled exe detection fixes:
+    - Config now re-resolves bundled/executable paths on startup/settings load
+- Misc fixes:
+    - Fix for slow settings dialog startup
+    - Minor stability and logging improvements
+- Testing notes:
+    - Confirm app starts when merge_output_format is blank or invalid
+    - Trigger "Check for yt-dlp update" — confirm download to temp and safe replacement or .exe.new scheduling
+    - Verify bundled yt-dlp is detected after install and settings dialog opens fast
+    - Validate settings dialog no longer spawns repeated modal popups during open
+
 2.0.7
 -Added support for Deno-based extractors
 -Improved error handling during downloads

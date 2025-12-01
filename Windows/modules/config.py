@@ -306,7 +306,7 @@ ytdlp_config = {
     'list_formats': True,
     'ignore_errors': True,
     "concurrent_fragment_downloads": 5,
-    # "merge_output_format": "mp4",
+    "merge_output_format": "mp4",
     "outtmpl": '%(title)s.%(ext)s',
     "retries": 3,
     "ffmpeg_location": ffmpeg_actual_path, 
